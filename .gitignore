@@ -1,0 +1,12 @@
+DAVIS/
+DAVIS-2017-trainval-480p.zip
+data/
+__pycache__/
+fastdvdnet_env/
+logs_test/
+model.pth
+model_clipped_noise.pth
+img/9831-teaser.gif
+img/arch.png
+img/psnrs.png
+img/runtimes_all_log.png
