@@ -6,7 +6,7 @@ import argparse
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from models import FastDVDnet
+from models_dw import FastDVDnet
 from dataset import ValDataset
 # from dataloaders import train_dali_loader
 from simple_dataloader import train_simple_loader
@@ -101,7 +101,7 @@ def main(**args):
 			imgn_train = imgn_train.cuda(non_blocking=True)
 			noise = noise.cuda(non_blocking=True)
 			noise_map = stdn.expand((N, 1, H, W)).cuda(non_blocking=True) # one channel per image
-			
+
 			# Evaluate model and optimize it
 			out_train = model(imgn_train, noise_map)
 
