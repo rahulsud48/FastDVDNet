@@ -10,3 +10,5 @@ img/9831-teaser.gif
 img/arch.png
 img/psnrs.png
 img/runtimes_all_log.png
+data_overfit/
+logs_overfit/

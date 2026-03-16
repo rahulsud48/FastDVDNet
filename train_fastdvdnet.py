@@ -1,7 +1,7 @@
 """
 Trains a FastDVDnet model.
 """
-import time
+import time, sys
 import argparse
 import torch
 import torch.nn as nn
@@ -101,7 +101,7 @@ def main(**args):
 			imgn_train = imgn_train.cuda(non_blocking=True)
 			noise = noise.cuda(non_blocking=True)
 			noise_map = stdn.expand((N, 1, H, W)).cuda(non_blocking=True) # one channel per image
-
+			
 			# Evaluate model and optimize it
 			out_train = model(imgn_train, noise_map)
 

@@ -175,3 +175,8 @@ class FastDVDnet(nn.Module):
 		x = self.temp2(x20, x21, x22, noise_map)
 
 		return x
+
+
+if __name__ == "__main__":
+	model = FastDVDnet()
+	print(model)
