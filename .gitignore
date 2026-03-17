@@ -12,3 +12,9 @@ img/psnrs.png
 img/runtimes_all_log.png
 data_overfit/
 logs_overfit/
+logs_overfit_1/
+logs_overfit_dw/
+results_overfit/
+results/
+logs_all_data/
+results_data_all/

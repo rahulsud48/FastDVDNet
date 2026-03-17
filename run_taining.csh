@@ -1,7 +1,7 @@
 python train_fastdvdnet.py \
-  --trainset_dir data_overfit/train \
-  --valset_dir data_overfit/val \
-  --log_dir logs_overfit \
-  --batch_size 2 \
-  --epochs 50 \
-  --max_number_patches 5000
+  --trainset_dir data/train \
+  --valset_dir data/val \
+  --log_dir logs_all_data \
+  --batch_size 4 \
+  --epochs 80 \
+  --max_number_patches 256000
