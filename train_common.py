@@ -71,18 +71,16 @@ def lr_scheduler(epoch, argdict):
 		current_lr = argdict['lr']
 	return current_lr, reset_orthog
 
-def	log_train_psnr(result, imsource, loss, writer, epoch, idx, num_minibatches, training_params):
-	'''Logs trai loss.
-	'''
-	#Compute pnsr of the whole batch
-# 	psnr_train = batch_psnr(torch.clamp(result, 0., 1.), imsource, 1.)
+def log_train_psnr(result, imsource, loss, writer, epoch, idx, num_minibatches, training_params):
+    """Logs train loss and train PSNR."""
+    psnr_train = batch_psnr(torch.clamp(result, 0., 1.), imsource, 1.0)
 
-	# Log the scalar values
-	writer.add_scalar('loss', loss.item(), training_params['step'])
-# 	writer.add_scalar('PSNR on training data', psnr_train, \
-# 		  training_params['step'])
-	print("[epoch {}][{}/{}] loss: {:1.4f} PSNR_train: {:1.4f}".\
-		  format(epoch+1, idx+1, num_minibatches, loss.item(), 0.0))
+    writer.add_scalar('loss', loss.item(), training_params['step'])
+    writer.add_scalar('PSNR on training data', psnr_train, training_params['step'])
+
+    print("[epoch {}][{}/{}] loss: {:1.4f} PSNR_train: {:1.4f}".format(
+        epoch + 1, idx + 1, num_minibatches, loss.item(), psnr_train
+    ))
 
 def save_model_checkpoint(model, argdict, optimizer, train_pars, epoch):
 	"""Stores the model parameters under 'argdict['log_dir'] + '/net.pth'

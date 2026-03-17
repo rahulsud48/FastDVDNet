@@ -8,7 +8,7 @@ import time
 import cv2
 import torch
 import torch.nn as nn
-from models_dw import FastDVDnet
+from models import FastDVDnet
 from fastdvdnet import denoise_seq_fastdvdnet
 from utils import batch_psnr, init_logger_test, \
 				variable_to_cv2_image, remove_dataparallel_wrapper, open_sequence, close_logger

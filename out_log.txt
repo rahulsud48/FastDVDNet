@@ -1,0 +1,976 @@
+
+### Training FastDVDnet denoiser model ###
+> Parameters:
+	batch_size: 4
+	epochs: 80
+	resume_training: False
+	milestone: [50, 60]
+	lr: 0.001
+	no_orthog: False
+	save_every: 10
+	save_every_epochs: 5
+	noise_ival: [0.0196078431372549, 0.21568627450980393]
+	val_noiseL: 0.09803921568627451
+	patch_size: 96
+	temp_patch_size: 5
+	max_number_patches: 256000
+	log_dir: logs_small_3f
+	trainset_dir: data/train
+	valset_dir: data/val
+
+
+> Loading datasets ...
+	Open sequence in folder:  data/val/blackswan
+	Open sequence in folder:  data/val/camel
+	Open sequence in folder:  data/val/dance-twirl
+	Open sequence in folder:  data/val/kite-surf
+	Open sequence in folder:  data/val/soapbox
+	# of training samples: 256000
+
+########### Model Architecture ###############
+FastDVDnet(
+  (temp): DenBlock(
+    (inc): InputCvBlock(
+      (convblock): Sequential(
+        (0): Conv2d(12, 90, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), groups=3, bias=False)
+        (1): BatchNorm2d(90, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (2): ReLU(inplace=True)
+        (3): Conv2d(90, 32, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+        (4): BatchNorm2d(32, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (5): ReLU(inplace=True)
+      )
+    )
+    (downc0): DownBlock(
+      (convblock): Sequential(
+        (0): Conv2d(32, 64, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
+        (1): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (2): ReLU(inplace=True)
+        (3): CvBlock(
+          (convblock): Sequential(
+            (0): Conv2d(64, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+            (1): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+            (2): ReLU(inplace=True)
+            (3): Conv2d(64, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+            (4): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+            (5): ReLU(inplace=True)
+          )
+        )
+      )
+    )
+    (downc1): DownBlock(
+      (convblock): Sequential(
+        (0): Conv2d(64, 128, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
+        (1): BatchNorm2d(128, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (2): ReLU(inplace=True)
+        (3): CvBlock(
+          (convblock): Sequential(
+            (0): Conv2d(128, 128, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+            (1): BatchNorm2d(128, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+            (2): ReLU(inplace=True)
+            (3): Conv2d(128, 128, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+            (4): BatchNorm2d(128, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+            (5): ReLU(inplace=True)
+          )
+        )
+      )
+    )
+    (upc2): UpBlock(
+      (convblock): Sequential(
+        (0): CvBlock(
+          (convblock): Sequential(
+            (0): Conv2d(128, 128, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+            (1): BatchNorm2d(128, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+            (2): ReLU(inplace=True)
+            (3): Conv2d(128, 128, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+            (4): BatchNorm2d(128, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+            (5): ReLU(inplace=True)
+          )
+        )
+        (1): Conv2d(128, 256, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+        (2): PixelShuffle(upscale_factor=2)
+      )
+    )
+    (upc1): UpBlock(
+      (convblock): Sequential(
+        (0): CvBlock(
+          (convblock): Sequential(
+            (0): Conv2d(64, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+            (1): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+            (2): ReLU(inplace=True)
+            (3): Conv2d(64, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+            (4): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+            (5): ReLU(inplace=True)
+          )
+        )
+        (1): Conv2d(64, 128, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+        (2): PixelShuffle(upscale_factor=2)
+      )
+    )
+    (outc): OutputCvBlock(
+      (convblock): Sequential(
+        (0): Conv2d(32, 32, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+        (1): BatchNorm2d(32, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (2): ReLU(inplace=True)
+        (3): Conv2d(32, 3, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+      )
+    )
+  )
+)
+
+learning rate 0.001000
+[epoch 1][1/64000] loss: 16960.6133 PSNR_train: 6.6627
+[epoch 1][11/64000] loss: 772.1467 PSNR_train: 13.3744
+[epoch 1][21/64000] loss: 466.8755 PSNR_train: 16.2632
+[epoch 1][31/64000] loss: 715.4098 PSNR_train: 13.4382
+[epoch 1][41/64000] loss: 490.5966 PSNR_train: 15.1671
+[epoch 1][51/64000] loss: 348.8427 PSNR_train: 16.8255
+[epoch 1][61/64000] loss: 425.6965 PSNR_train: 15.7307
+[epoch 1][71/64000] loss: 234.5836 PSNR_train: 19.0868
+[epoch 1][81/64000] loss: 253.2670 PSNR_train: 18.0609
+[epoch 1][91/64000] loss: 313.9556 PSNR_train: 17.0393
+[epoch 1][101/64000] loss: 174.3682 PSNR_train: 20.1981
+[epoch 1][111/64000] loss: 477.9877 PSNR_train: 15.3130
+[epoch 1][121/64000] loss: 192.6171 PSNR_train: 19.8448
+[epoch 1][131/64000] loss: 158.2015 PSNR_train: 20.3819
+[epoch 1][141/64000] loss: 150.7331 PSNR_train: 20.3541
+[epoch 1][151/64000] loss: 167.4028 PSNR_train: 20.0116
+[epoch 1][161/64000] loss: 160.9998 PSNR_train: 21.1865
+[epoch 1][171/64000] loss: 184.1648 PSNR_train: 20.2454
+[epoch 1][181/64000] loss: 130.3667 PSNR_train: 21.3079
+[epoch 1][191/64000] loss: 99.4269 PSNR_train: 22.2474
+[epoch 1][201/64000] loss: 139.8469 PSNR_train: 20.7337
+[epoch 1][211/64000] loss: 182.8945 PSNR_train: 19.0199
+[epoch 1][221/64000] loss: 164.7796 PSNR_train: 20.0981
+[epoch 1][231/64000] loss: 157.0144 PSNR_train: 20.5819
+[epoch 1][241/64000] loss: 96.0833 PSNR_train: 22.2059
+[epoch 1][251/64000] loss: 107.9490 PSNR_train: 22.1804
+[epoch 1][261/64000] loss: 195.3242 PSNR_train: 19.6862
+[epoch 1][271/64000] loss: 80.3023 PSNR_train: 22.7216
+[epoch 1][281/64000] loss: 142.0748 PSNR_train: 20.1354
+[epoch 1][291/64000] loss: 133.1174 PSNR_train: 22.1051
+[epoch 1][301/64000] loss: 140.2185 PSNR_train: 20.5298
+[epoch 1][311/64000] loss: 110.9057 PSNR_train: 22.7119
+[epoch 1][321/64000] loss: 381.9706 PSNR_train: 15.9453
+[epoch 1][331/64000] loss: 183.1662 PSNR_train: 19.2900
+[epoch 1][341/64000] loss: 169.9396 PSNR_train: 20.0225
+[epoch 1][351/64000] loss: 160.7656 PSNR_train: 21.2165
+[epoch 1][361/64000] loss: 207.3953 PSNR_train: 18.9923
+[epoch 1][371/64000] loss: 114.4089 PSNR_train: 21.2299
+[epoch 1][381/64000] loss: 133.2744 PSNR_train: 20.3713
+[epoch 1][391/64000] loss: 120.9299 PSNR_train: 20.7382
+[epoch 1][401/64000] loss: 70.5716 PSNR_train: 23.8060
+[epoch 1][411/64000] loss: 79.6423 PSNR_train: 23.1520
+[epoch 1][421/64000] loss: 69.2454 PSNR_train: 24.8458
+[epoch 1][431/64000] loss: 139.3787 PSNR_train: 21.1676
+[epoch 1][441/64000] loss: 118.6494 PSNR_train: 21.4944
+[epoch 1][451/64000] loss: 88.4071 PSNR_train: 23.2236
+[epoch 1][461/64000] loss: 71.4567 PSNR_train: 23.3841
+[epoch 1][471/64000] loss: 269.8513 PSNR_train: 18.2820
+[epoch 1][481/64000] loss: 89.2234 PSNR_train: 22.8846
+[epoch 1][491/64000] loss: 80.2137 PSNR_train: 22.6733
+[epoch 1][501/64000] loss: 96.1043 PSNR_train: 22.1789
+[epoch 1][511/64000] loss: 107.1483 PSNR_train: 21.2718
+[epoch 1][521/64000] loss: 125.8029 PSNR_train: 21.5142
+[epoch 1][531/64000] loss: 528.5807 PSNR_train: 18.0525
+[epoch 1][541/64000] loss: 191.4518 PSNR_train: 20.0497
+[epoch 1][551/64000] loss: 90.3216 PSNR_train: 22.3058
+[epoch 1][561/64000] loss: 79.0210 PSNR_train: 22.9128
+[epoch 1][571/64000] loss: 84.8882 PSNR_train: 22.5529
+[epoch 1][581/64000] loss: 110.5279 PSNR_train: 21.1411
+[epoch 1][591/64000] loss: 75.8005 PSNR_train: 23.4172
+[epoch 1][601/64000] loss: 112.1882 PSNR_train: 22.0429
+[epoch 1][611/64000] loss: 136.4803 PSNR_train: 21.0391
+[epoch 1][621/64000] loss: 91.4063 PSNR_train: 22.5894
+[epoch 1][631/64000] loss: 134.4225 PSNR_train: 20.5190
+[epoch 1][641/64000] loss: 175.7066 PSNR_train: 19.7221
+[epoch 1][651/64000] loss: 67.7195 PSNR_train: 24.0520
+[epoch 1][661/64000] loss: 85.2385 PSNR_train: 22.3984
+[epoch 1][671/64000] loss: 156.9385 PSNR_train: 20.5872
+[epoch 1][681/64000] loss: 101.1625 PSNR_train: 21.6541
+[epoch 1][691/64000] loss: 89.4680 PSNR_train: 22.3811
+[epoch 1][701/64000] loss: 91.8526 PSNR_train: 22.3831
+[epoch 1][711/64000] loss: 89.9011 PSNR_train: 22.1975
+[epoch 1][721/64000] loss: 166.3390 PSNR_train: 20.6675
+[epoch 1][731/64000] loss: 103.5505 PSNR_train: 21.5460
+[epoch 1][741/64000] loss: 117.2782 PSNR_train: 21.2186
+[epoch 1][751/64000] loss: 74.0999 PSNR_train: 22.9932
+[epoch 1][761/64000] loss: 64.3469 PSNR_train: 23.3805
+[epoch 1][771/64000] loss: 99.6453 PSNR_train: 21.6525
+[epoch 1][781/64000] loss: 93.0065 PSNR_train: 23.4736
+[epoch 1][791/64000] loss: 66.1327 PSNR_train: 23.3240
+[epoch 1][801/64000] loss: 50.5625 PSNR_train: 25.1346
+[epoch 1][811/64000] loss: 40.9804 PSNR_train: 26.7726
+[epoch 1][821/64000] loss: 89.4331 PSNR_train: 22.6555
+[epoch 1][831/64000] loss: 60.9941 PSNR_train: 23.8302
+[epoch 1][841/64000] loss: 114.6633 PSNR_train: 21.1252
+[epoch 1][851/64000] loss: 54.2746 PSNR_train: 25.4818
+[epoch 1][861/64000] loss: 77.4436 PSNR_train: 23.4508
+[epoch 1][871/64000] loss: 123.7739 PSNR_train: 20.6116
+[epoch 1][881/64000] loss: 82.8357 PSNR_train: 22.6599
+[epoch 1][891/64000] loss: 83.4614 PSNR_train: 22.5612
+[epoch 1][901/64000] loss: 91.0763 PSNR_train: 21.9168
+[epoch 1][911/64000] loss: 68.5356 PSNR_train: 23.1445
+[epoch 1][921/64000] loss: 175.6135 PSNR_train: 19.3860
+[epoch 1][931/64000] loss: 113.5058 PSNR_train: 21.3162
+[epoch 1][941/64000] loss: 56.1018 PSNR_train: 23.9379
+[epoch 1][951/64000] loss: 76.9604 PSNR_train: 22.7500
+[epoch 1][961/64000] loss: 66.6142 PSNR_train: 24.3656
+[epoch 1][971/64000] loss: 70.0332 PSNR_train: 23.2252
+[epoch 1][981/64000] loss: 108.6974 PSNR_train: 21.6642
+[epoch 1][991/64000] loss: 65.0738 PSNR_train: 23.5817
+[epoch 1][1001/64000] loss: 261.7089 PSNR_train: 17.7126
+[epoch 1][1011/64000] loss: 59.4405 PSNR_train: 23.9394
+[epoch 1][1021/64000] loss: 59.6581 PSNR_train: 24.1044
+[epoch 1][1031/64000] loss: 61.2762 PSNR_train: 24.3110
+[epoch 1][1041/64000] loss: 131.0596 PSNR_train: 20.4163
+[epoch 1][1051/64000] loss: 96.8871 PSNR_train: 22.0780
+[epoch 1][1061/64000] loss: 120.2124 PSNR_train: 21.1738
+[epoch 1][1071/64000] loss: 60.0283 PSNR_train: 24.2583
+[epoch 1][1081/64000] loss: 103.7672 PSNR_train: 21.6710
+[epoch 1][1091/64000] loss: 48.1876 PSNR_train: 24.9746
+[epoch 1][1101/64000] loss: 58.7952 PSNR_train: 24.0409
+[epoch 1][1111/64000] loss: 74.5662 PSNR_train: 23.5869
+[epoch 1][1121/64000] loss: 54.0401 PSNR_train: 25.2198
+[epoch 1][1131/64000] loss: 138.4608 PSNR_train: 20.2643
+[epoch 1][1141/64000] loss: 106.5522 PSNR_train: 22.4477
+[epoch 1][1151/64000] loss: 59.9897 PSNR_train: 24.4205
+[epoch 1][1161/64000] loss: 44.2973 PSNR_train: 25.9784
+[epoch 1][1171/64000] loss: 67.1768 PSNR_train: 23.2530
+[epoch 1][1181/64000] loss: 61.8883 PSNR_train: 23.5639
+[epoch 1][1191/64000] loss: 122.7651 PSNR_train: 21.1720
+[epoch 1][1201/64000] loss: 95.0194 PSNR_train: 22.8846
+[epoch 1][1211/64000] loss: 181.2249 PSNR_train: 19.8808
+[epoch 1][1221/64000] loss: 91.8948 PSNR_train: 22.4348
+[epoch 1][1231/64000] loss: 38.4916 PSNR_train: 26.4847
+[epoch 1][1241/64000] loss: 129.5638 PSNR_train: 20.8184
+[epoch 1][1251/64000] loss: 80.9142 PSNR_train: 23.2463
+[epoch 1][1261/64000] loss: 77.5853 PSNR_train: 23.4823
+[epoch 1][1271/64000] loss: 55.3227 PSNR_train: 24.9099
+[epoch 1][1281/64000] loss: 58.9362 PSNR_train: 23.9684
+[epoch 1][1291/64000] loss: 68.0472 PSNR_train: 23.2679
+[epoch 1][1301/64000] loss: 90.9932 PSNR_train: 21.9912
+[epoch 1][1311/64000] loss: 70.2233 PSNR_train: 23.0526
+[epoch 1][1321/64000] loss: 86.5592 PSNR_train: 22.5201
+[epoch 1][1331/64000] loss: 26.9558 PSNR_train: 27.8048
+[epoch 1][1341/64000] loss: 221.1137 PSNR_train: 19.6213
+[epoch 1][1351/64000] loss: 84.6589 PSNR_train: 22.3474
+[epoch 1][1361/64000] loss: 155.1782 PSNR_train: 19.8072
+[epoch 1][1371/64000] loss: 67.3223 PSNR_train: 23.3292
+[epoch 1][1381/64000] loss: 34.7644 PSNR_train: 26.2899
+[epoch 1][1391/64000] loss: 56.2575 PSNR_train: 24.4444
+[epoch 1][1401/64000] loss: 80.3596 PSNR_train: 22.6309
+[epoch 1][1411/64000] loss: 66.9080 PSNR_train: 25.0033
+[epoch 1][1421/64000] loss: 64.0313 PSNR_train: 23.5765
+[epoch 1][1431/64000] loss: 84.0631 PSNR_train: 22.3459
+[epoch 1][1441/64000] loss: 127.5344 PSNR_train: 20.5449
+[epoch 1][1451/64000] loss: 149.0891 PSNR_train: 20.0037
+[epoch 1][1461/64000] loss: 67.0382 PSNR_train: 23.5847
+[epoch 1][1471/64000] loss: 72.0971 PSNR_train: 22.9851
+[epoch 1][1481/64000] loss: 50.4863 PSNR_train: 24.8808
+[epoch 1][1491/64000] loss: 90.8322 PSNR_train: 23.7824
+[epoch 1][1501/64000] loss: 58.2666 PSNR_train: 24.2733
+[epoch 1][1511/64000] loss: 137.4675 PSNR_train: 22.0889
+[epoch 1][1521/64000] loss: 91.9421 PSNR_train: 22.1948
+[epoch 1][1531/64000] loss: 72.8791 PSNR_train: 22.8740
+[epoch 1][1541/64000] loss: 140.3994 PSNR_train: 20.5916
+[epoch 1][1551/64000] loss: 120.2318 PSNR_train: 20.7006
+[epoch 1][1561/64000] loss: 68.8358 PSNR_train: 23.3064
+[epoch 1][1571/64000] loss: 104.3910 PSNR_train: 21.9786
+[epoch 1][1581/64000] loss: 66.2385 PSNR_train: 24.6618
+[epoch 1][1591/64000] loss: 79.4137 PSNR_train: 22.8643
+[epoch 1][1601/64000] loss: 66.5011 PSNR_train: 25.0055
+[epoch 1][1611/64000] loss: 51.8633 PSNR_train: 25.0027
+[epoch 1][1621/64000] loss: 96.7877 PSNR_train: 21.6490
+[epoch 1][1631/64000] loss: 60.7506 PSNR_train: 24.3213
+[epoch 1][1641/64000] loss: 89.9837 PSNR_train: 22.0658
+[epoch 1][1651/64000] loss: 107.0031 PSNR_train: 21.7202
+[epoch 1][1661/64000] loss: 40.9813 PSNR_train: 25.4698
+[epoch 1][1671/64000] loss: 96.3999 PSNR_train: 22.4280
+[epoch 1][1681/64000] loss: 66.4401 PSNR_train: 23.5327
+[epoch 1][1691/64000] loss: 39.5066 PSNR_train: 25.7878
+[epoch 1][1701/64000] loss: 62.0104 PSNR_train: 23.7447
+[epoch 1][1711/64000] loss: 61.3758 PSNR_train: 23.7616
+[epoch 1][1721/64000] loss: 127.2669 PSNR_train: 21.0240
+[epoch 1][1731/64000] loss: 46.2088 PSNR_train: 26.1073
+[epoch 1][1741/64000] loss: 60.2990 PSNR_train: 24.6783
+[epoch 1][1751/64000] loss: 92.5768 PSNR_train: 24.1956
+[epoch 1][1761/64000] loss: 211.7372 PSNR_train: 18.4327
+[epoch 1][1771/64000] loss: 47.5754 PSNR_train: 24.7787
+[epoch 1][1781/64000] loss: 157.5517 PSNR_train: 19.7096
+[epoch 1][1791/64000] loss: 98.3332 PSNR_train: 21.8362
+[epoch 1][1801/64000] loss: 43.6371 PSNR_train: 25.7402
+[epoch 1][1811/64000] loss: 76.2428 PSNR_train: 23.0068
+[epoch 1][1821/64000] loss: 88.1457 PSNR_train: 22.0752
+[epoch 1][1831/64000] loss: 55.7916 PSNR_train: 24.0386
+[epoch 1][1841/64000] loss: 48.4437 PSNR_train: 25.2146
+[epoch 1][1851/64000] loss: 79.1766 PSNR_train: 22.6104
+[epoch 1][1861/64000] loss: 121.0973 PSNR_train: 21.0131
+[epoch 1][1871/64000] loss: 38.3633 PSNR_train: 26.2835
+[epoch 1][1881/64000] loss: 87.6486 PSNR_train: 22.6632
+[epoch 1][1891/64000] loss: 55.9934 PSNR_train: 24.2596
+[epoch 1][1901/64000] loss: 40.9383 PSNR_train: 25.5700
+[epoch 1][1911/64000] loss: 81.6220 PSNR_train: 23.1701
+[epoch 1][1921/64000] loss: 56.6858 PSNR_train: 24.0281
+[epoch 1][1931/64000] loss: 39.2603 PSNR_train: 26.4592
+[epoch 1][1941/64000] loss: 51.8471 PSNR_train: 24.4446
+[epoch 1][1951/64000] loss: 71.1899 PSNR_train: 23.2462
+[epoch 1][1961/64000] loss: 163.6501 PSNR_train: 19.8305
+[epoch 1][1971/64000] loss: 96.2368 PSNR_train: 21.8947
+[epoch 1][1981/64000] loss: 35.7481 PSNR_train: 26.2503
+[epoch 1][1991/64000] loss: 48.6849 PSNR_train: 24.8462
+[epoch 1][2001/64000] loss: 52.3198 PSNR_train: 25.7774
+[epoch 1][2011/64000] loss: 149.2533 PSNR_train: 19.8364
+[epoch 1][2021/64000] loss: 36.8600 PSNR_train: 26.3834
+[epoch 1][2031/64000] loss: 31.5204 PSNR_train: 26.9702
+[epoch 1][2041/64000] loss: 90.3724 PSNR_train: 22.1763
+[epoch 1][2051/64000] loss: 45.6483 PSNR_train: 25.0735
+[epoch 1][2061/64000] loss: 48.7642 PSNR_train: 24.8377
+[epoch 1][2071/64000] loss: 41.4891 PSNR_train: 25.9460
+[epoch 1][2081/64000] loss: 57.3783 PSNR_train: 23.9688
+[epoch 1][2091/64000] loss: 62.1848 PSNR_train: 24.0905
+[epoch 1][2101/64000] loss: 107.0874 PSNR_train: 22.3890
+[epoch 1][2111/64000] loss: 52.1016 PSNR_train: 24.7440
+[epoch 1][2121/64000] loss: 82.8623 PSNR_train: 22.7898
+[epoch 1][2131/64000] loss: 107.1917 PSNR_train: 22.4989
+[epoch 1][2141/64000] loss: 46.8954 PSNR_train: 25.1723
+[epoch 1][2151/64000] loss: 64.1105 PSNR_train: 23.9237
+[epoch 1][2161/64000] loss: 67.8681 PSNR_train: 23.5542
+[epoch 1][2171/64000] loss: 83.7650 PSNR_train: 23.5689
+[epoch 1][2181/64000] loss: 116.0463 PSNR_train: 21.8172
+[epoch 1][2191/64000] loss: 113.4991 PSNR_train: 21.6344
+[epoch 1][2201/64000] loss: 132.5646 PSNR_train: 20.5917
+[epoch 1][2211/64000] loss: 60.0823 PSNR_train: 23.9624
+[epoch 1][2221/64000] loss: 71.6761 PSNR_train: 23.1984
+[epoch 1][2231/64000] loss: 44.5346 PSNR_train: 25.2670
+[epoch 1][2241/64000] loss: 91.0274 PSNR_train: 22.3115
+[epoch 1][2251/64000] loss: 43.6522 PSNR_train: 25.7595
+[epoch 1][2261/64000] loss: 76.8848 PSNR_train: 23.4938
+[epoch 1][2271/64000] loss: 120.9095 PSNR_train: 20.8031
+[epoch 1][2281/64000] loss: 343.6039 PSNR_train: 16.7108
+[epoch 1][2291/64000] loss: 69.8229 PSNR_train: 23.6660
+[epoch 1][2301/64000] loss: 68.3172 PSNR_train: 23.2339
+[epoch 1][2311/64000] loss: 103.0648 PSNR_train: 21.8798
+[epoch 1][2321/64000] loss: 87.3772 PSNR_train: 22.1978
+[epoch 1][2331/64000] loss: 66.2838 PSNR_train: 23.6667
+[epoch 1][2341/64000] loss: 45.1527 PSNR_train: 26.4323
+[epoch 1][2351/64000] loss: 50.8505 PSNR_train: 24.6684
+[epoch 1][2361/64000] loss: 118.1991 PSNR_train: 21.6999
+[epoch 1][2371/64000] loss: 85.4902 PSNR_train: 22.6891
+[epoch 1][2381/64000] loss: 77.7106 PSNR_train: 22.6722
+[epoch 1][2391/64000] loss: 47.0221 PSNR_train: 26.0625
+[epoch 1][2401/64000] loss: 82.0266 PSNR_train: 22.7070
+[epoch 1][2411/64000] loss: 120.8658 PSNR_train: 23.0628
+[epoch 1][2421/64000] loss: 64.3481 PSNR_train: 24.0947
+[epoch 1][2431/64000] loss: 52.5165 PSNR_train: 24.8715
+[epoch 1][2441/64000] loss: 81.3232 PSNR_train: 22.4244
+[epoch 1][2451/64000] loss: 93.8412 PSNR_train: 22.4284
+[epoch 1][2461/64000] loss: 71.8109 PSNR_train: 23.2060
+[epoch 1][2471/64000] loss: 132.7222 PSNR_train: 20.6568
+[epoch 1][2481/64000] loss: 41.5388 PSNR_train: 25.6918
+[epoch 1][2491/64000] loss: 44.0315 PSNR_train: 25.5173
+[epoch 1][2501/64000] loss: 50.0116 PSNR_train: 24.6713
+[epoch 1][2511/64000] loss: 71.6710 PSNR_train: 24.4329
+[epoch 1][2521/64000] loss: 75.5527 PSNR_train: 23.0334
+[epoch 1][2531/64000] loss: 97.7655 PSNR_train: 21.8410
+[epoch 1][2541/64000] loss: 132.4409 PSNR_train: 20.7864
+[epoch 1][2551/64000] loss: 99.6694 PSNR_train: 21.7388
+[epoch 1][2561/64000] loss: 87.9347 PSNR_train: 22.4997
+[epoch 1][2571/64000] loss: 37.7412 PSNR_train: 26.8743
+[epoch 1][2581/64000] loss: 58.7503 PSNR_train: 24.3288
+[epoch 1][2591/64000] loss: 51.2173 PSNR_train: 24.6140
+[epoch 1][2601/64000] loss: 141.4063 PSNR_train: 20.8849
+[epoch 1][2611/64000] loss: 85.0488 PSNR_train: 24.0215
+[epoch 1][2621/64000] loss: 141.1477 PSNR_train: 20.1296
+[epoch 1][2631/64000] loss: 108.0302 PSNR_train: 23.0266
+[epoch 1][2641/64000] loss: 54.4513 PSNR_train: 24.1412
+[epoch 1][2651/64000] loss: 53.6204 PSNR_train: 24.2147
+[epoch 1][2661/64000] loss: 90.1613 PSNR_train: 22.9949
+[epoch 1][2671/64000] loss: 37.9909 PSNR_train: 25.9017
+[epoch 1][2681/64000] loss: 65.0008 PSNR_train: 23.3884
+[epoch 1][2691/64000] loss: 108.2672 PSNR_train: 21.3242
+[epoch 1][2701/64000] loss: 88.5988 PSNR_train: 22.9432
+[epoch 1][2711/64000] loss: 45.8546 PSNR_train: 25.6419
+[epoch 1][2721/64000] loss: 52.2771 PSNR_train: 24.8985
+[epoch 1][2731/64000] loss: 77.6438 PSNR_train: 22.8043
+[epoch 1][2741/64000] loss: 52.9308 PSNR_train: 24.6811
+[epoch 1][2751/64000] loss: 49.1143 PSNR_train: 26.1637
+[epoch 1][2761/64000] loss: 113.0552 PSNR_train: 21.6057
+[epoch 1][2771/64000] loss: 59.3860 PSNR_train: 24.4203
+[epoch 1][2781/64000] loss: 84.2298 PSNR_train: 22.3097
+[epoch 1][2791/64000] loss: 57.4671 PSNR_train: 24.9570
+[epoch 1][2801/64000] loss: 56.0929 PSNR_train: 24.4165
+[epoch 1][2811/64000] loss: 219.9594 PSNR_train: 18.4976
+[epoch 1][2821/64000] loss: 204.1761 PSNR_train: 18.7151
+[epoch 1][2831/64000] loss: 76.9167 PSNR_train: 22.8682
+[epoch 1][2841/64000] loss: 64.1367 PSNR_train: 23.7400
+[epoch 1][2851/64000] loss: 93.8536 PSNR_train: 22.0183
+[epoch 1][2861/64000] loss: 70.8599 PSNR_train: 23.4113
+[epoch 1][2871/64000] loss: 112.4616 PSNR_train: 23.2702
+[epoch 1][2881/64000] loss: 55.3370 PSNR_train: 24.4588
+[epoch 1][2891/64000] loss: 35.5839 PSNR_train: 26.8352
+[epoch 1][2901/64000] loss: 75.1238 PSNR_train: 22.9898
+[epoch 1][2911/64000] loss: 85.6596 PSNR_train: 25.2771
+[epoch 1][2921/64000] loss: 239.9467 PSNR_train: 18.5011
+[epoch 1][2931/64000] loss: 70.5921 PSNR_train: 25.2173
+[epoch 1][2941/64000] loss: 48.9677 PSNR_train: 24.5986
+[epoch 1][2951/64000] loss: 83.5556 PSNR_train: 23.0132
+[epoch 1][2961/64000] loss: 62.4046 PSNR_train: 24.3558
+[epoch 1][2971/64000] loss: 74.5566 PSNR_train: 23.0469
+[epoch 1][2981/64000] loss: 72.0661 PSNR_train: 23.1641
+[epoch 1][2991/64000] loss: 50.4151 PSNR_train: 24.5027
+[epoch 1][3001/64000] loss: 62.7056 PSNR_train: 24.5192
+[epoch 1][3011/64000] loss: 146.1175 PSNR_train: 20.0634
+[epoch 1][3021/64000] loss: 78.6991 PSNR_train: 22.5395
+[epoch 1][3031/64000] loss: 103.6637 PSNR_train: 21.9763
+[epoch 1][3041/64000] loss: 127.1684 PSNR_train: 20.8412
+[epoch 1][3051/64000] loss: 58.5340 PSNR_train: 23.9433
+[epoch 1][3061/64000] loss: 53.2692 PSNR_train: 24.3282
+[epoch 1][3071/64000] loss: 108.6855 PSNR_train: 23.6665
+[epoch 1][3081/64000] loss: 97.4348 PSNR_train: 22.6511
+[epoch 1][3091/64000] loss: 37.9759 PSNR_train: 26.1244
+[epoch 1][3101/64000] loss: 77.5298 PSNR_train: 22.9779
+[epoch 1][3111/64000] loss: 48.4361 PSNR_train: 26.4670
+[epoch 1][3121/64000] loss: 103.9867 PSNR_train: 21.5118
+[epoch 1][3131/64000] loss: 81.7014 PSNR_train: 23.4228
+[epoch 1][3141/64000] loss: 39.4036 PSNR_train: 26.3322
+[epoch 1][3151/64000] loss: 98.8866 PSNR_train: 22.6374
+[epoch 1][3161/64000] loss: 66.0040 PSNR_train: 23.5202
+[epoch 1][3171/64000] loss: 39.1050 PSNR_train: 25.6143
+[epoch 1][3181/64000] loss: 63.5437 PSNR_train: 23.6057
+[epoch 1][3191/64000] loss: 98.8398 PSNR_train: 21.9507
+[epoch 1][3201/64000] loss: 115.8056 PSNR_train: 21.2325
+[epoch 1][3211/64000] loss: 61.1617 PSNR_train: 24.1970
+[epoch 1][3221/64000] loss: 45.3949 PSNR_train: 25.3488
+[epoch 1][3231/64000] loss: 55.6788 PSNR_train: 25.2948
+[epoch 1][3241/64000] loss: 68.4287 PSNR_train: 23.2949
+[epoch 1][3251/64000] loss: 107.8539 PSNR_train: 21.2890
+[epoch 1][3261/64000] loss: 70.1088 PSNR_train: 24.2353
+[epoch 1][3271/64000] loss: 54.7586 PSNR_train: 24.5831
+[epoch 1][3281/64000] loss: 81.3514 PSNR_train: 23.5681
+[epoch 1][3291/64000] loss: 84.6507 PSNR_train: 23.1299
+[epoch 1][3301/64000] loss: 66.3919 PSNR_train: 24.0629
+[epoch 1][3311/64000] loss: 63.7903 PSNR_train: 23.6407
+[epoch 1][3321/64000] loss: 46.7402 PSNR_train: 26.0576
+[epoch 1][3331/64000] loss: 112.3034 PSNR_train: 21.1698
+[epoch 1][3341/64000] loss: 42.9100 PSNR_train: 25.7998
+[epoch 1][3351/64000] loss: 59.7230 PSNR_train: 23.7724
+[epoch 1][3361/64000] loss: 109.0721 PSNR_train: 21.1062
+[epoch 1][3371/64000] loss: 50.4790 PSNR_train: 25.3187
+[epoch 1][3381/64000] loss: 302.2613 PSNR_train: 17.3809
+[epoch 1][3391/64000] loss: 50.2106 PSNR_train: 24.8473
+[epoch 1][3401/64000] loss: 176.2684 PSNR_train: 19.3422
+[epoch 1][3411/64000] loss: 55.1950 PSNR_train: 25.1844
+[epoch 1][3421/64000] loss: 64.3068 PSNR_train: 23.4713
+[epoch 1][3431/64000] loss: 67.9278 PSNR_train: 23.2312
+[epoch 1][3441/64000] loss: 87.3771 PSNR_train: 23.0547
+[epoch 1][3451/64000] loss: 47.5405 PSNR_train: 25.7089
+[epoch 1][3461/64000] loss: 300.6279 PSNR_train: 17.2044
+[epoch 1][3471/64000] loss: 34.8107 PSNR_train: 26.9557
+[epoch 1][3481/64000] loss: 128.9159 PSNR_train: 21.6982
+[epoch 1][3491/64000] loss: 218.2093 PSNR_train: 18.7691
+[epoch 1][3501/64000] loss: 73.1693 PSNR_train: 25.1653
+[epoch 1][3511/64000] loss: 91.2173 PSNR_train: 22.3824
+[epoch 1][3521/64000] loss: 66.7883 PSNR_train: 23.2870
+[epoch 1][3531/64000] loss: 52.4453 PSNR_train: 24.7253
+[epoch 1][3541/64000] loss: 102.3304 PSNR_train: 21.8634
+[epoch 1][3551/64000] loss: 66.7675 PSNR_train: 23.3525
+[epoch 1][3561/64000] loss: 89.9941 PSNR_train: 23.0935
+[epoch 1][3571/64000] loss: 98.4213 PSNR_train: 21.6622
+[epoch 1][3581/64000] loss: 41.4695 PSNR_train: 25.6419
+[epoch 1][3591/64000] loss: 148.1316 PSNR_train: 20.1552
+[epoch 1][3601/64000] loss: 66.8859 PSNR_train: 23.9740
+[epoch 1][3611/64000] loss: 55.0656 PSNR_train: 24.1439
+[epoch 1][3621/64000] loss: 521.1002 PSNR_train: 15.6531
+[epoch 1][3631/64000] loss: 73.2522 PSNR_train: 22.9186
+[epoch 1][3641/64000] loss: 70.3726 PSNR_train: 23.6295
+[epoch 1][3651/64000] loss: 69.3661 PSNR_train: 23.5078
+[epoch 1][3661/64000] loss: 46.8235 PSNR_train: 25.0172
+[epoch 1][3671/64000] loss: 33.2008 PSNR_train: 27.4930
+[epoch 1][3681/64000] loss: 36.5265 PSNR_train: 25.9287
+[epoch 1][3691/64000] loss: 64.8483 PSNR_train: 24.9713
+[epoch 1][3701/64000] loss: 53.7892 PSNR_train: 24.8816
+[epoch 1][3711/64000] loss: 47.9159 PSNR_train: 25.0754
+[epoch 1][3721/64000] loss: 64.1257 PSNR_train: 23.6154
+[epoch 1][3731/64000] loss: 598.0444 PSNR_train: 14.5777
+[epoch 1][3741/64000] loss: 81.1795 PSNR_train: 22.4473
+[epoch 1][3751/64000] loss: 207.8341 PSNR_train: 23.8698
+[epoch 1][3761/64000] loss: 64.0636 PSNR_train: 23.8745
+[epoch 1][3771/64000] loss: 185.5394 PSNR_train: 19.0820
+[epoch 1][3781/64000] loss: 52.9758 PSNR_train: 24.7102
+[epoch 1][3791/64000] loss: 51.8273 PSNR_train: 24.3724
+[epoch 1][3801/64000] loss: 190.3452 PSNR_train: 19.5504
+[epoch 1][3811/64000] loss: 105.6121 PSNR_train: 21.4390
+[epoch 1][3821/64000] loss: 146.3318 PSNR_train: 20.9320
+[epoch 1][3831/64000] loss: 83.4772 PSNR_train: 22.9810
+[epoch 1][3841/64000] loss: 82.4796 PSNR_train: 23.4380
+[epoch 1][3851/64000] loss: 107.3420 PSNR_train: 21.5984
+[epoch 1][3861/64000] loss: 60.4725 PSNR_train: 24.7407
+[epoch 1][3871/64000] loss: 46.7784 PSNR_train: 25.4429
+[epoch 1][3881/64000] loss: 48.2817 PSNR_train: 26.1802
+[epoch 1][3891/64000] loss: 202.9581 PSNR_train: 19.0629
+[epoch 1][3901/64000] loss: 49.0745 PSNR_train: 24.8288
+[epoch 1][3911/64000] loss: 72.9980 PSNR_train: 23.1461
+[epoch 1][3921/64000] loss: 52.7654 PSNR_train: 24.7266
+[epoch 1][3931/64000] loss: 74.1937 PSNR_train: 23.0046
+[epoch 1][3941/64000] loss: 63.3763 PSNR_train: 24.1588
+[epoch 1][3951/64000] loss: 155.4545 PSNR_train: 20.8186
+[epoch 1][3961/64000] loss: 88.1319 PSNR_train: 22.1255
+[epoch 1][3971/64000] loss: 103.9789 PSNR_train: 21.7605
+[epoch 1][3981/64000] loss: 65.1707 PSNR_train: 24.1665
+[epoch 1][3991/64000] loss: 57.8808 PSNR_train: 24.0900
+[epoch 1][4001/64000] loss: 42.9134 PSNR_train: 25.9515
+[epoch 1][4011/64000] loss: 64.4659 PSNR_train: 23.8325
+[epoch 1][4021/64000] loss: 127.4947 PSNR_train: 20.7868
+[epoch 1][4031/64000] loss: 73.2648 PSNR_train: 23.2857
+[epoch 1][4041/64000] loss: 62.8750 PSNR_train: 24.5204
+[epoch 1][4051/64000] loss: 37.9007 PSNR_train: 26.7454
+[epoch 1][4061/64000] loss: 139.6188 PSNR_train: 20.2343
+[epoch 1][4071/64000] loss: 139.3766 PSNR_train: 20.7955
+[epoch 1][4081/64000] loss: 61.6833 PSNR_train: 24.6440
+[epoch 1][4091/64000] loss: 64.5034 PSNR_train: 24.4644
+[epoch 1][4101/64000] loss: 53.5511 PSNR_train: 24.4666
+[epoch 1][4111/64000] loss: 57.0398 PSNR_train: 24.3576
+[epoch 1][4121/64000] loss: 61.6805 PSNR_train: 24.1635
+[epoch 1][4131/64000] loss: 53.8992 PSNR_train: 24.2786
+[epoch 1][4141/64000] loss: 89.7167 PSNR_train: 22.4102
+[epoch 1][4151/64000] loss: 34.8160 PSNR_train: 26.1327
+[epoch 1][4161/64000] loss: 77.1526 PSNR_train: 23.1141
+[epoch 1][4171/64000] loss: 57.6210 PSNR_train: 24.5287
+[epoch 1][4181/64000] loss: 79.2919 PSNR_train: 23.0347
+[epoch 1][4191/64000] loss: 62.8152 PSNR_train: 24.2187
+[epoch 1][4201/64000] loss: 81.9905 PSNR_train: 22.7223
+[epoch 1][4211/64000] loss: 47.8053 PSNR_train: 24.8699
+[epoch 1][4221/64000] loss: 30.3281 PSNR_train: 27.2472
+[epoch 1][4231/64000] loss: 54.3174 PSNR_train: 25.5837
+[epoch 1][4241/64000] loss: 58.1803 PSNR_train: 26.5185
+[epoch 1][4251/64000] loss: 38.8579 PSNR_train: 26.2552
+[epoch 1][4261/64000] loss: 60.5142 PSNR_train: 24.2499
+[epoch 1][4271/64000] loss: 54.6739 PSNR_train: 24.2938
+[epoch 1][4281/64000] loss: 45.7028 PSNR_train: 25.5707
+[epoch 1][4291/64000] loss: 72.0361 PSNR_train: 23.6323
+[epoch 1][4301/64000] loss: 50.7083 PSNR_train: 24.5594
+[epoch 1][4311/64000] loss: 40.3018 PSNR_train: 26.6799
+[epoch 1][4321/64000] loss: 46.8315 PSNR_train: 25.8847
+[epoch 1][4331/64000] loss: 98.4249 PSNR_train: 21.5935
+[epoch 1][4341/64000] loss: 96.0023 PSNR_train: 22.0927
+[epoch 1][4351/64000] loss: 94.7547 PSNR_train: 23.2093
+[epoch 1][4361/64000] loss: 137.7437 PSNR_train: 20.4057
+[epoch 1][4371/64000] loss: 54.1373 PSNR_train: 24.3158
+[epoch 1][4381/64000] loss: 61.0298 PSNR_train: 25.1594
+[epoch 1][4391/64000] loss: 101.7042 PSNR_train: 21.9059
+[epoch 1][4401/64000] loss: 98.0899 PSNR_train: 22.0051
+[epoch 1][4411/64000] loss: 84.7445 PSNR_train: 24.3160
+[epoch 1][4421/64000] loss: 69.6246 PSNR_train: 23.2372
+[epoch 1][4431/64000] loss: 61.2210 PSNR_train: 23.6327
+[epoch 1][4441/64000] loss: 77.1418 PSNR_train: 23.7785
+[epoch 1][4451/64000] loss: 61.1281 PSNR_train: 24.0171
+[epoch 1][4461/64000] loss: 83.7021 PSNR_train: 22.7341
+[epoch 1][4471/64000] loss: 69.3214 PSNR_train: 24.6115
+[epoch 1][4481/64000] loss: 73.8472 PSNR_train: 23.2302
+[epoch 1][4491/64000] loss: 109.2297 PSNR_train: 21.3718
+[epoch 1][4501/64000] loss: 82.5752 PSNR_train: 22.3772
+[epoch 1][4511/64000] loss: 89.8641 PSNR_train: 22.6170
+[epoch 1][4521/64000] loss: 36.4627 PSNR_train: 26.5379
+[epoch 1][4531/64000] loss: 40.2148 PSNR_train: 26.2609
+[epoch 1][4541/64000] loss: 105.4521 PSNR_train: 23.8517
+[epoch 1][4551/64000] loss: 74.5213 PSNR_train: 22.8238
+[epoch 1][4561/64000] loss: 60.6153 PSNR_train: 24.7494
+[epoch 1][4571/64000] loss: 67.9513 PSNR_train: 23.1720
+[epoch 1][4581/64000] loss: 58.4767 PSNR_train: 23.9756
+[epoch 1][4591/64000] loss: 45.1102 PSNR_train: 26.0877
+[epoch 1][4601/64000] loss: 55.5748 PSNR_train: 24.7888
+[epoch 1][4611/64000] loss: 56.5519 PSNR_train: 24.3495
+[epoch 1][4621/64000] loss: 45.5122 PSNR_train: 24.9667
+[epoch 1][4631/64000] loss: 56.1778 PSNR_train: 24.1191
+[epoch 1][4641/64000] loss: 56.9781 PSNR_train: 25.3857
+[epoch 1][4651/64000] loss: 281.2650 PSNR_train: 17.3113
+[epoch 1][4661/64000] loss: 51.3021 PSNR_train: 24.4807
+[epoch 1][4671/64000] loss: 65.3510 PSNR_train: 23.3377
+[epoch 1][4681/64000] loss: 51.2860 PSNR_train: 24.4386
+[epoch 1][4691/64000] loss: 55.8064 PSNR_train: 24.3035
+[epoch 1][4701/64000] loss: 65.6786 PSNR_train: 23.6452
+[epoch 1][4711/64000] loss: 70.3724 PSNR_train: 24.6272
+[epoch 1][4721/64000] loss: 94.9773 PSNR_train: 21.9217
+[epoch 1][4731/64000] loss: 90.7333 PSNR_train: 23.1202
+[epoch 1][4741/64000] loss: 164.5529 PSNR_train: 20.6266
+[epoch 1][4751/64000] loss: 40.2461 PSNR_train: 25.9090
+[epoch 1][4761/64000] loss: 109.7385 PSNR_train: 22.8828
+[epoch 1][4771/64000] loss: 78.4574 PSNR_train: 23.7572
+[epoch 1][4781/64000] loss: 67.0069 PSNR_train: 23.7244
+[epoch 1][4791/64000] loss: 50.2696 PSNR_train: 26.0790
+[epoch 1][4801/64000] loss: 136.1820 PSNR_train: 21.0913
+[epoch 1][4811/64000] loss: 98.5838 PSNR_train: 21.9380
+[epoch 1][4821/64000] loss: 53.6373 PSNR_train: 25.1898
+[epoch 1][4831/64000] loss: 144.4414 PSNR_train: 20.0886
+[epoch 1][4841/64000] loss: 45.8537 PSNR_train: 25.1745
+[epoch 1][4851/64000] loss: 56.0560 PSNR_train: 24.1715
+[epoch 1][4861/64000] loss: 40.6522 PSNR_train: 25.4113
+[epoch 1][4871/64000] loss: 86.3447 PSNR_train: 22.1886
+[epoch 1][4881/64000] loss: 60.7078 PSNR_train: 24.0975
+[epoch 1][4891/64000] loss: 67.5262 PSNR_train: 23.8249
+[epoch 1][4901/64000] loss: 50.2272 PSNR_train: 25.4352
+[epoch 1][4911/64000] loss: 47.6906 PSNR_train: 25.2183
+[epoch 1][4921/64000] loss: 99.8888 PSNR_train: 21.5118
+[epoch 1][4931/64000] loss: 49.7407 PSNR_train: 24.8371
+[epoch 1][4941/64000] loss: 83.5358 PSNR_train: 22.8310
+[epoch 1][4951/64000] loss: 94.8046 PSNR_train: 23.0086
+[epoch 1][4961/64000] loss: 91.5932 PSNR_train: 22.7594
+[epoch 1][4971/64000] loss: 105.2951 PSNR_train: 22.7074
+[epoch 1][4981/64000] loss: 59.8865 PSNR_train: 25.3393
+[epoch 1][4991/64000] loss: 71.8803 PSNR_train: 24.0935
+[epoch 1][5001/64000] loss: 113.0811 PSNR_train: 21.4216
+[epoch 1][5011/64000] loss: 107.8419 PSNR_train: 21.3653
+[epoch 1][5021/64000] loss: 72.0870 PSNR_train: 24.1002
+[epoch 1][5031/64000] loss: 73.7424 PSNR_train: 23.1300
+[epoch 1][5041/64000] loss: 50.9128 PSNR_train: 25.7374
+[epoch 1][5051/64000] loss: 62.6639 PSNR_train: 23.7497
+[epoch 1][5061/64000] loss: 55.6890 PSNR_train: 25.1265
+[epoch 1][5071/64000] loss: 62.5652 PSNR_train: 23.5029
+[epoch 1][5081/64000] loss: 37.2002 PSNR_train: 25.9528
+[epoch 1][5091/64000] loss: 47.0249 PSNR_train: 25.4027
+[epoch 1][5101/64000] loss: 29.3779 PSNR_train: 26.8401
+[epoch 1][5111/64000] loss: 56.2799 PSNR_train: 25.0916
+[epoch 1][5121/64000] loss: 211.8366 PSNR_train: 19.0863
+[epoch 1][5131/64000] loss: 85.6994 PSNR_train: 22.7294
+[epoch 1][5141/64000] loss: 59.6931 PSNR_train: 24.3120
+[epoch 1][5151/64000] loss: 946.9097 PSNR_train: 13.6080
+[epoch 1][5161/64000] loss: 560.7687 PSNR_train: 15.1624
+[epoch 1][5171/64000] loss: 270.5145 PSNR_train: 20.6241
+[epoch 1][5181/64000] loss: 129.6023 PSNR_train: 22.6983
+[epoch 1][5191/64000] loss: 96.6395 PSNR_train: 22.1856
+[epoch 1][5201/64000] loss: 181.1731 PSNR_train: 19.9958
+[epoch 1][5211/64000] loss: 148.0736 PSNR_train: 20.4847
+[epoch 1][5221/64000] loss: 74.2646 PSNR_train: 22.8692
+[epoch 1][5231/64000] loss: 93.7772 PSNR_train: 22.6025
+[epoch 1][5241/64000] loss: 92.7561 PSNR_train: 22.0635
+[epoch 1][5251/64000] loss: 45.9308 PSNR_train: 25.2464
+[epoch 1][5261/64000] loss: 60.5541 PSNR_train: 23.8730
+[epoch 1][5271/64000] loss: 136.3362 PSNR_train: 20.6432
+[epoch 1][5281/64000] loss: 49.0285 PSNR_train: 24.8266
+[epoch 1][5291/64000] loss: 149.7564 PSNR_train: 20.7458
+[epoch 1][5301/64000] loss: 93.5424 PSNR_train: 21.9902
+[epoch 1][5311/64000] loss: 94.6597 PSNR_train: 21.7462
+[epoch 1][5321/64000] loss: 58.6598 PSNR_train: 25.1790
+[epoch 1][5331/64000] loss: 42.7378 PSNR_train: 25.7182
+[epoch 1][5341/64000] loss: 87.3631 PSNR_train: 22.8758
+[epoch 1][5351/64000] loss: 31.5078 PSNR_train: 26.8893
+[epoch 1][5361/64000] loss: 269.3940 PSNR_train: 17.5681
+[epoch 1][5371/64000] loss: 74.1030 PSNR_train: 22.9898
+[epoch 1][5381/64000] loss: 56.0792 PSNR_train: 24.8945
+[epoch 1][5391/64000] loss: 174.5299 PSNR_train: 19.6064
+[epoch 1][5401/64000] loss: 70.6476 PSNR_train: 23.4392
+[epoch 1][5411/64000] loss: 55.3655 PSNR_train: 24.2808
+[epoch 1][5421/64000] loss: 79.1086 PSNR_train: 22.9643
+[epoch 1][5431/64000] loss: 46.6597 PSNR_train: 25.1261
+[epoch 1][5441/64000] loss: 87.5716 PSNR_train: 22.2063
+[epoch 1][5451/64000] loss: 34.0119 PSNR_train: 27.0982
+[epoch 1][5461/64000] loss: 39.8161 PSNR_train: 25.5236
+[epoch 1][5471/64000] loss: 72.2204 PSNR_train: 23.7255
+[epoch 1][5481/64000] loss: 42.7624 PSNR_train: 25.2251
+[epoch 1][5491/64000] loss: 45.2138 PSNR_train: 25.0441
+[epoch 1][5501/64000] loss: 152.6952 PSNR_train: 21.5615
+[epoch 1][5511/64000] loss: 42.1153 PSNR_train: 25.7102
+[epoch 1][5521/64000] loss: 45.2152 PSNR_train: 25.8353
+[epoch 1][5531/64000] loss: 51.9734 PSNR_train: 25.4462
+[epoch 1][5541/64000] loss: 54.9457 PSNR_train: 24.4724
+[epoch 1][5551/64000] loss: 52.4270 PSNR_train: 24.6766
+[epoch 1][5561/64000] loss: 33.2470 PSNR_train: 26.7484
+[epoch 1][5571/64000] loss: 59.5575 PSNR_train: 24.0703
+[epoch 1][5581/64000] loss: 38.9442 PSNR_train: 25.9208
+[epoch 1][5591/64000] loss: 61.8853 PSNR_train: 23.8863
+[epoch 1][5601/64000] loss: 58.7118 PSNR_train: 23.9686
+[epoch 1][5611/64000] loss: 39.6410 PSNR_train: 25.6361
+[epoch 1][5621/64000] loss: 50.4458 PSNR_train: 24.8817
+[epoch 1][5631/64000] loss: 41.0696 PSNR_train: 27.0930
+[epoch 1][5641/64000] loss: 70.4744 PSNR_train: 23.6207
+[epoch 1][5651/64000] loss: 56.3087 PSNR_train: 24.3967
+[epoch 1][5661/64000] loss: 23.8903 PSNR_train: 28.4975
+[epoch 1][5671/64000] loss: 38.3759 PSNR_train: 25.6456
+[epoch 1][5681/64000] loss: 40.5340 PSNR_train: 25.5540
+[epoch 1][5691/64000] loss: 51.0295 PSNR_train: 26.0482
+[epoch 1][5701/64000] loss: 45.0980 PSNR_train: 25.5570
+[epoch 1][5711/64000] loss: 70.7675 PSNR_train: 23.1582
+[epoch 1][5721/64000] loss: 52.8682 PSNR_train: 24.2948
+[epoch 1][5731/64000] loss: 85.7575 PSNR_train: 22.6656
+[epoch 1][5741/64000] loss: 78.2955 PSNR_train: 23.3659
+[epoch 1][5751/64000] loss: 52.5394 PSNR_train: 25.8189
+[epoch 1][5761/64000] loss: 39.0266 PSNR_train: 26.5001
+[epoch 1][5771/64000] loss: 75.6721 PSNR_train: 22.8031
+[epoch 1][5781/64000] loss: 60.3196 PSNR_train: 24.4714
+[epoch 1][5791/64000] loss: 71.2639 PSNR_train: 23.5465
+[epoch 1][5801/64000] loss: 60.8205 PSNR_train: 24.8529
+[epoch 1][5811/64000] loss: 98.6954 PSNR_train: 21.6579
+[epoch 1][5821/64000] loss: 78.7740 PSNR_train: 23.2901
+[epoch 1][5831/64000] loss: 48.1025 PSNR_train: 25.1120
+[epoch 1][5841/64000] loss: 74.3362 PSNR_train: 24.1558
+[epoch 1][5851/64000] loss: 52.3763 PSNR_train: 24.7258
+[epoch 1][5861/64000] loss: 60.1965 PSNR_train: 24.2933
+[epoch 1][5871/64000] loss: 60.3609 PSNR_train: 25.0541
+[epoch 1][5881/64000] loss: 34.4440 PSNR_train: 26.3278
+[epoch 1][5891/64000] loss: 90.0458 PSNR_train: 24.3483
+[epoch 1][5901/64000] loss: 72.8650 PSNR_train: 24.1628
+[epoch 1][5911/64000] loss: 51.3127 PSNR_train: 25.1438
+[epoch 1][5921/64000] loss: 44.5358 PSNR_train: 25.6305
+[epoch 1][5931/64000] loss: 74.4098 PSNR_train: 23.1148
+[epoch 1][5941/64000] loss: 39.7557 PSNR_train: 25.9186
+[epoch 1][5951/64000] loss: 44.0252 PSNR_train: 25.7945
+[epoch 1][5961/64000] loss: 100.1022 PSNR_train: 23.6272
+[epoch 1][5971/64000] loss: 33.6692 PSNR_train: 27.2981
+[epoch 1][5981/64000] loss: 129.4716 PSNR_train: 20.5310
+[epoch 1][5991/64000] loss: 56.0634 PSNR_train: 24.1917
+[epoch 1][6001/64000] loss: 60.6306 PSNR_train: 23.8921
+[epoch 1][6011/64000] loss: 35.1122 PSNR_train: 26.8195
+[epoch 1][6021/64000] loss: 123.8656 PSNR_train: 21.2901
+[epoch 1][6031/64000] loss: 89.9163 PSNR_train: 22.2272
+[epoch 1][6041/64000] loss: 54.7323 PSNR_train: 24.4074
+[epoch 1][6051/64000] loss: 72.9737 PSNR_train: 23.6476
+[epoch 1][6061/64000] loss: 73.5057 PSNR_train: 23.5433
+[epoch 1][6071/64000] loss: 106.1945 PSNR_train: 21.2546
+[epoch 1][6081/64000] loss: 54.5068 PSNR_train: 25.1850
+[epoch 1][6091/64000] loss: 48.4496 PSNR_train: 24.8356
+[epoch 1][6101/64000] loss: 119.3873 PSNR_train: 20.8935
+[epoch 1][6111/64000] loss: 88.3565 PSNR_train: 22.6027
+[epoch 1][6121/64000] loss: 87.7647 PSNR_train: 22.9725
+[epoch 1][6131/64000] loss: 49.7776 PSNR_train: 24.5587
+[epoch 1][6141/64000] loss: 50.4466 PSNR_train: 24.6006
+[epoch 1][6151/64000] loss: 54.9463 PSNR_train: 25.2794
+[epoch 1][6161/64000] loss: 89.8145 PSNR_train: 22.4639
+[epoch 1][6171/64000] loss: 57.7221 PSNR_train: 23.9815
+[epoch 1][6181/64000] loss: 34.6394 PSNR_train: 26.3278
+[epoch 1][6191/64000] loss: 91.4227 PSNR_train: 22.1821
+[epoch 1][6201/64000] loss: 39.0100 PSNR_train: 26.2812
+[epoch 1][6211/64000] loss: 59.3470 PSNR_train: 24.0534
+[epoch 1][6221/64000] loss: 49.3897 PSNR_train: 24.5442
+[epoch 1][6231/64000] loss: 33.2442 PSNR_train: 26.4023
+[epoch 1][6241/64000] loss: 47.3333 PSNR_train: 24.7392
+[epoch 1][6251/64000] loss: 34.9974 PSNR_train: 26.1109
+[epoch 1][6261/64000] loss: 51.8335 PSNR_train: 24.6789
+[epoch 1][6271/64000] loss: 42.7808 PSNR_train: 25.2495
+[epoch 1][6281/64000] loss: 48.2001 PSNR_train: 24.8815
+[epoch 1][6291/64000] loss: 33.8416 PSNR_train: 27.1973
+[epoch 1][6301/64000] loss: 94.4167 PSNR_train: 21.9986
+[epoch 1][6311/64000] loss: 66.9112 PSNR_train: 23.2640
+[epoch 1][6321/64000] loss: 32.9822 PSNR_train: 26.8723
+[epoch 1][6331/64000] loss: 55.6078 PSNR_train: 24.8770
+[epoch 1][6341/64000] loss: 51.3280 PSNR_train: 25.0798
+[epoch 1][6351/64000] loss: 89.0850 PSNR_train: 22.0605
+[epoch 1][6361/64000] loss: 70.4583 PSNR_train: 23.4996
+[epoch 1][6371/64000] loss: 211.0032 PSNR_train: 20.4378
+[epoch 1][6381/64000] loss: 45.0444 PSNR_train: 25.0801
+[epoch 1][6391/64000] loss: 56.8552 PSNR_train: 24.5511
+[epoch 1][6401/64000] loss: 56.4641 PSNR_train: 24.4365
+[epoch 1][6411/64000] loss: 74.1137 PSNR_train: 23.5631
+[epoch 1][6421/64000] loss: 55.6156 PSNR_train: 24.3795
+[epoch 1][6431/64000] loss: 28.8707 PSNR_train: 26.8825
+[epoch 1][6441/64000] loss: 67.6035 PSNR_train: 23.3395
+[epoch 1][6451/64000] loss: 69.0795 PSNR_train: 23.3989
+[epoch 1][6461/64000] loss: 446.0748 PSNR_train: 15.8847
+[epoch 1][6471/64000] loss: 50.1436 PSNR_train: 24.4831
+[epoch 1][6481/64000] loss: 103.1082 PSNR_train: 21.5029
+[epoch 1][6491/64000] loss: 97.5558 PSNR_train: 21.9841
+[epoch 1][6501/64000] loss: 49.4021 PSNR_train: 25.3915
+[epoch 1][6511/64000] loss: 57.5774 PSNR_train: 23.9515
+[epoch 1][6521/64000] loss: 37.4954 PSNR_train: 27.1205
+[epoch 1][6531/64000] loss: 41.6830 PSNR_train: 27.2663
+[epoch 1][6541/64000] loss: 100.4768 PSNR_train: 21.8444
+[epoch 1][6551/64000] loss: 54.2290 PSNR_train: 25.0559
+[epoch 1][6561/64000] loss: 104.6133 PSNR_train: 21.5324
+[epoch 1][6571/64000] loss: 68.9307 PSNR_train: 24.0029
+[epoch 1][6581/64000] loss: 148.0348 PSNR_train: 21.2910
+[epoch 1][6591/64000] loss: 231.0653 PSNR_train: 18.1088
+[epoch 1][6601/64000] loss: 79.2147 PSNR_train: 22.8599
+[epoch 1][6611/64000] loss: 36.7462 PSNR_train: 26.1698
+[epoch 1][6621/64000] loss: 67.4411 PSNR_train: 23.4511
+[epoch 1][6631/64000] loss: 110.5855 PSNR_train: 21.6200
+[epoch 1][6641/64000] loss: 33.9515 PSNR_train: 26.3687
+[epoch 1][6651/64000] loss: 44.5176 PSNR_train: 25.3673
+[epoch 1][6661/64000] loss: 54.0543 PSNR_train: 25.9450
+[epoch 1][6671/64000] loss: 65.6691 PSNR_train: 24.0193
+[epoch 1][6681/64000] loss: 58.4350 PSNR_train: 24.8816
+[epoch 1][6691/64000] loss: 59.3500 PSNR_train: 25.5531
+[epoch 1][6701/64000] loss: 49.1240 PSNR_train: 24.9017
+[epoch 1][6711/64000] loss: 38.8238 PSNR_train: 25.7330
+[epoch 1][6721/64000] loss: 56.6465 PSNR_train: 24.5766
+[epoch 1][6731/64000] loss: 355.9374 PSNR_train: 16.7657
+[epoch 1][6741/64000] loss: 353.0826 PSNR_train: 16.7418
+[epoch 1][6751/64000] loss: 114.7140 PSNR_train: 21.1870
+[epoch 1][6761/64000] loss: 60.5187 PSNR_train: 23.6949
+[epoch 1][6771/64000] loss: 82.3190 PSNR_train: 23.1116
+[epoch 1][6781/64000] loss: 46.1293 PSNR_train: 25.4248
+[epoch 1][6791/64000] loss: 90.5182 PSNR_train: 26.6986
+[epoch 1][6801/64000] loss: 47.4168 PSNR_train: 24.8348
+[epoch 1][6811/64000] loss: 51.3026 PSNR_train: 25.0129
+[epoch 1][6821/64000] loss: 46.1862 PSNR_train: 25.3138
+[epoch 1][6831/64000] loss: 34.8301 PSNR_train: 26.2924
+[epoch 1][6841/64000] loss: 27.9997 PSNR_train: 27.3185
+[epoch 1][6851/64000] loss: 49.2796 PSNR_train: 26.9337
+[epoch 1][6861/64000] loss: 54.3164 PSNR_train: 24.5011
+[epoch 1][6871/64000] loss: 28.3090 PSNR_train: 27.8901
+[epoch 1][6881/64000] loss: 64.9029 PSNR_train: 23.5719
+[epoch 1][6891/64000] loss: 51.6493 PSNR_train: 24.6755
+[epoch 1][6901/64000] loss: 66.8087 PSNR_train: 23.5817
+[epoch 1][6911/64000] loss: 60.9299 PSNR_train: 23.8523
+[epoch 1][6921/64000] loss: 55.5009 PSNR_train: 24.7880
+[epoch 1][6931/64000] loss: 51.6018 PSNR_train: 24.6805
+[epoch 1][6941/64000] loss: 46.4757 PSNR_train: 25.2060
+[epoch 1][6951/64000] loss: 29.2398 PSNR_train: 27.1878
+[epoch 1][6961/64000] loss: 69.8133 PSNR_train: 23.0084
+[epoch 1][6971/64000] loss: 43.5200 PSNR_train: 25.7685
+[epoch 1][6981/64000] loss: 45.1976 PSNR_train: 25.2515
+[epoch 1][6991/64000] loss: 82.4603 PSNR_train: 24.1594
+[epoch 1][7001/64000] loss: 78.2672 PSNR_train: 23.3010
+[epoch 1][7011/64000] loss: 166.1077 PSNR_train: 21.3721
+[epoch 1][7021/64000] loss: 201.5086 PSNR_train: 18.6431
+[epoch 1][7031/64000] loss: 166.1072 PSNR_train: 19.8601
+[epoch 1][7041/64000] loss: 67.3788 PSNR_train: 23.3994
+[epoch 1][7051/64000] loss: 106.5693 PSNR_train: 22.1810
+[epoch 1][7061/64000] loss: 39.8973 PSNR_train: 25.4765
+[epoch 1][7071/64000] loss: 60.4680 PSNR_train: 24.4167
+[epoch 1][7081/64000] loss: 109.2321 PSNR_train: 21.7154
+[epoch 1][7091/64000] loss: 53.8504 PSNR_train: 25.9145
+[epoch 1][7101/64000] loss: 39.5494 PSNR_train: 26.3673
+[epoch 1][7111/64000] loss: 35.1953 PSNR_train: 26.3041
+[epoch 1][7121/64000] loss: 50.1960 PSNR_train: 24.6260
+[epoch 1][7131/64000] loss: 73.6644 PSNR_train: 23.0898
+[epoch 1][7141/64000] loss: 44.6041 PSNR_train: 25.1035
+[epoch 1][7151/64000] loss: 107.8971 PSNR_train: 21.8156
+[epoch 1][7161/64000] loss: 28.4190 PSNR_train: 27.8958
+[epoch 1][7171/64000] loss: 55.2583 PSNR_train: 24.7490
+[epoch 1][7181/64000] loss: 50.4147 PSNR_train: 24.5556
+[epoch 1][7191/64000] loss: 55.8236 PSNR_train: 24.9438
+[epoch 1][7201/64000] loss: 34.5987 PSNR_train: 26.2804
+[epoch 1][7211/64000] loss: 50.9958 PSNR_train: 24.5242
+[epoch 1][7221/64000] loss: 86.7534 PSNR_train: 22.4959
+[epoch 1][7231/64000] loss: 212.7384 PSNR_train: 18.3356
+[epoch 1][7241/64000] loss: 30.9330 PSNR_train: 27.0797
+[epoch 1][7251/64000] loss: 55.8266 PSNR_train: 24.0122
+[epoch 1][7261/64000] loss: 53.6971 PSNR_train: 25.6585
+[epoch 1][7271/64000] loss: 50.3608 PSNR_train: 26.0596
+[epoch 1][7281/64000] loss: 95.0023 PSNR_train: 22.9901
+[epoch 1][7291/64000] loss: 57.6430 PSNR_train: 24.6535
+[epoch 1][7301/64000] loss: 53.8811 PSNR_train: 25.3983
+[epoch 1][7311/64000] loss: 116.1688 PSNR_train: 21.1875
+[epoch 1][7321/64000] loss: 60.8604 PSNR_train: 24.8954
+[epoch 1][7331/64000] loss: 190.7475 PSNR_train: 19.7477
+[epoch 1][7341/64000] loss: 130.7017 PSNR_train: 21.6996
+[epoch 1][7351/64000] loss: 62.4933 PSNR_train: 24.2820
+[epoch 1][7361/64000] loss: 83.2355 PSNR_train: 23.5030
+[epoch 1][7371/64000] loss: 69.6269 PSNR_train: 23.3271
+[epoch 1][7381/64000] loss: 601.5912 PSNR_train: 15.0455
+[epoch 1][7391/64000] loss: 86.2499 PSNR_train: 24.5736
+[epoch 1][7401/64000] loss: 71.3948 PSNR_train: 23.8881
+[epoch 1][7411/64000] loss: 98.4038 PSNR_train: 23.3007
+[epoch 1][7421/64000] loss: 84.3740 PSNR_train: 22.7533
+[epoch 1][7431/64000] loss: 231.7632 PSNR_train: 18.2529
+[epoch 1][7441/64000] loss: 54.9447 PSNR_train: 25.2528
+[epoch 1][7451/64000] loss: 115.8924 PSNR_train: 21.9690
+[epoch 1][7461/64000] loss: 50.9393 PSNR_train: 24.5855
+[epoch 1][7471/64000] loss: 159.3711 PSNR_train: 20.0096
+[epoch 1][7481/64000] loss: 81.9690 PSNR_train: 24.4874
+[epoch 1][7491/64000] loss: 58.8132 PSNR_train: 23.9202
+[epoch 1][7501/64000] loss: 29.2022 PSNR_train: 27.4045
+[epoch 1][7511/64000] loss: 40.4045 PSNR_train: 25.7320
+[epoch 1][7521/64000] loss: 48.6442 PSNR_train: 25.0371
+[epoch 1][7531/64000] loss: 73.1102 PSNR_train: 23.8252
+[epoch 1][7541/64000] loss: 50.2192 PSNR_train: 24.4492
+[epoch 1][7551/64000] loss: 112.8762 PSNR_train: 21.6360
+[epoch 1][7561/64000] loss: 52.0038 PSNR_train: 25.4845
+[epoch 1][7571/64000] loss: 48.8215 PSNR_train: 25.0969
+[epoch 1][7581/64000] loss: 45.1239 PSNR_train: 25.2774
+[epoch 1][7591/64000] loss: 42.0071 PSNR_train: 26.5171
+[epoch 1][7601/64000] loss: 32.5285 PSNR_train: 26.4978
+[epoch 1][7611/64000] loss: 64.5256 PSNR_train: 23.9593
+[epoch 1][7621/64000] loss: 44.0572 PSNR_train: 26.0361
+[epoch 1][7631/64000] loss: 39.1297 PSNR_train: 26.0275
+[epoch 1][7641/64000] loss: 57.4229 PSNR_train: 25.9975
+[epoch 1][7651/64000] loss: 87.1054 PSNR_train: 22.2182
+[epoch 1][7661/64000] loss: 236.3792 PSNR_train: 17.9810
+[epoch 1][7671/64000] loss: 78.5877 PSNR_train: 23.1256
+[epoch 1][7681/64000] loss: 95.8545 PSNR_train: 21.8165
+[epoch 1][7691/64000] loss: 48.3644 PSNR_train: 24.8042
+[epoch 1][7701/64000] loss: 79.8227 PSNR_train: 22.6764
+[epoch 1][7711/64000] loss: 45.7145 PSNR_train: 25.2937
+[epoch 1][7721/64000] loss: 60.2044 PSNR_train: 23.9318
+[epoch 1][7731/64000] loss: 72.3989 PSNR_train: 23.0610
+[epoch 1][7741/64000] loss: 52.0879 PSNR_train: 25.6191
+[epoch 1][7751/64000] loss: 41.2482 PSNR_train: 25.3134
+[epoch 1][7761/64000] loss: 42.6365 PSNR_train: 27.3023
+[epoch 1][7771/64000] loss: 270.5247 PSNR_train: 17.4291
+[epoch 1][7781/64000] loss: 26.6812 PSNR_train: 27.5154
+[epoch 1][7791/64000] loss: 73.5959 PSNR_train: 22.8687
+[epoch 1][7801/64000] loss: 78.8695 PSNR_train: 22.7510
+[epoch 1][7811/64000] loss: 70.3535 PSNR_train: 24.6934
+[epoch 1][7821/64000] loss: 57.3363 PSNR_train: 24.8547
+[epoch 1][7831/64000] loss: 46.8494 PSNR_train: 26.6917
+[epoch 1][7841/64000] loss: 63.8905 PSNR_train: 23.6277
+[epoch 1][7851/64000] loss: 43.6873 PSNR_train: 25.8635
+[epoch 1][7861/64000] loss: 45.8458 PSNR_train: 26.4399
+[epoch 1][7871/64000] loss: 85.3927 PSNR_train: 23.0470
+[epoch 1][7881/64000] loss: 28.3437 PSNR_train: 27.2237
+[epoch 1][7891/64000] loss: 35.1144 PSNR_train: 26.4528
+[epoch 1][7901/64000] loss: 47.6049 PSNR_train: 24.9736
+[epoch 1][7911/64000] loss: 101.4011 PSNR_train: 21.7427
+[epoch 1][7921/64000] loss: 106.8520 PSNR_train: 23.4714
+[epoch 1][7931/64000] loss: 171.1444 PSNR_train: 19.5368
+[epoch 1][7941/64000] loss: 92.1193 PSNR_train: 22.9549
+[epoch 1][7951/64000] loss: 39.9273 PSNR_train: 25.7617
+[epoch 1][7961/64000] loss: 39.7520 PSNR_train: 25.5559
+[epoch 1][7971/64000] loss: 44.6501 PSNR_train: 24.9341
+[epoch 1][7981/64000] loss: 18.5071 PSNR_train: 28.7999
+[epoch 1][7991/64000] loss: 124.6836 PSNR_train: 21.0264
+[epoch 1][8001/64000] loss: 55.9458 PSNR_train: 24.2810
+[epoch 1][8011/64000] loss: 40.9955 PSNR_train: 25.5667
+[epoch 1][8021/64000] loss: 46.8587 PSNR_train: 24.7466
+[epoch 1][8031/64000] loss: 37.9510 PSNR_train: 26.2807
+[epoch 1][8041/64000] loss: 79.6258 PSNR_train: 23.8822
+[epoch 1][8051/64000] loss: 43.3969 PSNR_train: 25.3585
+[epoch 1][8061/64000] loss: 51.4904 PSNR_train: 25.0253
+[epoch 1][8071/64000] loss: 30.0736 PSNR_train: 26.9884
+[epoch 1][8081/64000] loss: 99.6903 PSNR_train: 21.8703
+[epoch 1][8091/64000] loss: 61.9409 PSNR_train: 23.8798
+[epoch 1][8101/64000] loss: 181.1381 PSNR_train: 20.9945
+[epoch 1][8111/64000] loss: 324.3133 PSNR_train: 18.2900
+[epoch 1][8121/64000] loss: 262.4512 PSNR_train: 18.1493
+[epoch 1][8131/64000] loss: 118.0503 PSNR_train: 21.2903
+[epoch 1][8141/64000] loss: 110.8949 PSNR_train: 22.8785
+[epoch 1][8151/64000] loss: 119.9699 PSNR_train: 21.5658
+[epoch 1][8161/64000] loss: 150.5205 PSNR_train: 20.1244
+[epoch 1][8171/64000] loss: 127.4175 PSNR_train: 20.6538
+[epoch 1][8181/64000] loss: 44.4336 PSNR_train: 25.5920
+[epoch 1][8191/64000] loss: 89.2044 PSNR_train: 22.8824
+[epoch 1][8201/64000] loss: 43.9858 PSNR_train: 25.7236
+[epoch 1][8211/64000] loss: 50.8782 PSNR_train: 25.1819
+[epoch 1][8221/64000] loss: 48.5716 PSNR_train: 25.1756
+[epoch 1][8231/64000] loss: 142.1906 PSNR_train: 20.2627
+[epoch 1][8241/64000] loss: 44.8624 PSNR_train: 25.2905
+[epoch 1][8251/64000] loss: 39.9828 PSNR_train: 26.3234
+[epoch 1][8261/64000] loss: 35.4187 PSNR_train: 26.1884
+[epoch 1][8271/64000] loss: 118.6115 PSNR_train: 21.5618
+[epoch 1][8281/64000] loss: 81.0599 PSNR_train: 23.1817
+[epoch 1][8291/64000] loss: 112.5859 PSNR_train: 21.6398
+[epoch 1][8301/64000] loss: 47.5157 PSNR_train: 25.2549
+[epoch 1][8311/64000] loss: 39.5037 PSNR_train: 25.7123
+[epoch 1][8321/64000] loss: 37.7418 PSNR_train: 25.8600
+[epoch 1][8331/64000] loss: 60.5714 PSNR_train: 23.8594
+[epoch 1][8341/64000] loss: 60.4268 PSNR_train: 24.1154
+[epoch 1][8351/64000] loss: 38.3659 PSNR_train: 26.3585
+[epoch 1][8361/64000] loss: 155.1822 PSNR_train: 20.4878
+[epoch 1][8371/64000] loss: 146.1633 PSNR_train: 20.5287
+[epoch 1][8381/64000] loss: 56.9945 PSNR_train: 23.9126
+[epoch 1][8391/64000] loss: 140.3056 PSNR_train: 20.6256
+[epoch 1][8401/64000] loss: 52.4157 PSNR_train: 24.6001
+[epoch 1][8411/64000] loss: 56.3719 PSNR_train: 24.4053
+[epoch 1][8421/64000] loss: 45.9977 PSNR_train: 25.1323
+[epoch 1][8431/64000] loss: 107.4433 PSNR_train: 21.6655
+[epoch 1][8441/64000] loss: 39.7119 PSNR_train: 25.5839
+[epoch 1][8451/64000] loss: 61.3181 PSNR_train: 24.5483
+[epoch 1][8461/64000] loss: 62.5723 PSNR_train: 23.7385
+[epoch 1][8471/64000] loss: 45.5570 PSNR_train: 25.8032
+[epoch 1][8481/64000] loss: 46.4333 PSNR_train: 25.5557
+[epoch 1][8491/64000] loss: 60.9565 PSNR_train: 24.1349
+[epoch 1][8501/64000] loss: 87.1404 PSNR_train: 22.1831
+[epoch 1][8511/64000] loss: 34.7146 PSNR_train: 26.4169
+[epoch 1][8521/64000] loss: 123.1232 PSNR_train: 20.7735
+[epoch 1][8531/64000] loss: 50.2295 PSNR_train: 24.5556
+[epoch 1][8541/64000] loss: 30.6528 PSNR_train: 26.8696
+[epoch 1][8551/64000] loss: 170.7869 PSNR_train: 19.5935

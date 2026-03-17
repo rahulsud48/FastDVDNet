@@ -6,7 +6,7 @@ import argparse
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from models_dw import FastDVDnet
+from models import FastDVDnet
 from dataset import ValDataset
 # from dataloaders import train_dali_loader
 from simple_dataloader import train_simple_loader
@@ -44,6 +44,8 @@ def main(**args):
 
 	# Create model
 	model = FastDVDnet()
+	print("########### Model Architecture ###############")
+	print(model)
 	model = nn.DataParallel(model, device_ids=device_ids).cuda()
 
 	# Define loss
