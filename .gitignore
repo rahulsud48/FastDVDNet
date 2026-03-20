@@ -19,3 +19,7 @@ results/
 logs_all_data/
 results_data_all/
 logs_small_3f/
+logs_1d_conv/
+.gitignore
+results_data_1d/
+out_log.txt

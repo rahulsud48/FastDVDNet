@@ -1,5 +1,5 @@
 python test_fastdvdnet.py \
-  --model_file logs_all_data/net.pth \
+  --model_file logs_1d_conv/net.pth \
   --test_path data/val/blackswan \
   --noise_sigma 25 \
-  --save_path results_data_all
+  --save_path results_data_1d
