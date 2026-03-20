@@ -3,6 +3,7 @@ Definition of the FastDVDnet model
 """
 import torch
 import torch.nn as nn
+from torchinfo import summary
 
 class CvBlock(nn.Module):
 	'''(Conv2d => BN => ReLU) x 2'''
@@ -157,5 +158,13 @@ class FastDVDnet(nn.Module):
 
 
 if __name__ == "__main__":
-	model = FastDVDnet()
-	print(model)
+
+
+    model = FastDVDnet()
+
+    summary(
+        model,
+        input_data=(torch.randn(1, 9, 96, 96), torch.randn(1, 1, 96, 96)),
+        col_names=["input_size", "output_size", "num_params"],
+        depth=4
+    )

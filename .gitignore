@@ -20,3 +20,6 @@ logs_all_data/
 results_data_all/
 logs_small_3f/
 logs_small_3f/log.txt
+results_data_1d/
+.gitignore
+logs_1d_conv/
