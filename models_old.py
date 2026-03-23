@@ -1,14 +1,14 @@
 """
-FastDVDnet with SegNet-style decoder
-- keeps the same outer environment
-- uses DW + PW convolutions
-- encoder stores pooling indices
-- decoder uses MaxUnpool2d
+Definition of the FastDVDnet model
+Depthwise-separable version:
+each Conv2d(3x3) is replaced by:
+    depthwise 3x3 + pointwise 1x1
+No no_orthog changes introduced.
 """
 
 import torch
 import torch.nn as nn
-from torchinfo import summary
+
 
 
 class DSConv(nn.Module):
@@ -55,10 +55,7 @@ class CvBlock(nn.Module):
 
 
 class InputCvBlock(nn.Module):
-    """
-    Keep this close to original FastDVDnet:
-    grouped conv + DSConv
-    """
+    """(Grouped Conv with num_in_frames groups => BN => ReLU) + (DSConv => BN => ReLU)"""
     def __init__(self, num_in_frames, out_ch):
         super(InputCvBlock, self).__init__()
         self.interm_ch = 30
@@ -82,49 +79,33 @@ class InputCvBlock(nn.Module):
         return self.convblock(x)
 
 
-class SegNetDownBlock(nn.Module):
-    """
-    Conv processing followed by MaxPool with indices
-    Returns:
-        pooled output,
-        pooling indices,
-        feature map size before pooling
-    """
+class DownBlock(nn.Module):
+    """Downscale + (DSConv => BN => ReLU)*2"""
     def __init__(self, in_ch, out_ch):
-        super(SegNetDownBlock, self).__init__()
+        super(DownBlock, self).__init__()
         self.convblock = nn.Sequential(
-            DSConv(in_ch, out_ch),
+            DSConv(in_ch, out_ch, stride=2),
             nn.BatchNorm2d(out_ch),
             nn.ReLU(inplace=True),
             CvBlock(out_ch, out_ch)
         )
-        self.pool = nn.MaxPool2d(kernel_size=2, stride=2, return_indices=True)
 
     def forward(self, x):
-        x = self.convblock(x)
-        size_before_pool = x.size()
-        x, indices = self.pool(x)
-        return x, indices, size_before_pool
+        return self.convblock(x)
 
 
-class SegNetUpBlock(nn.Module):
-    """
-    MaxUnpool followed by conv refinement
-    """
+class UpBlock(nn.Module):
+    """(DSConv => BN => ReLU)*2 + Upscale"""
     def __init__(self, in_ch, out_ch):
-        super(SegNetUpBlock, self).__init__()
-        self.unpool = nn.MaxUnpool2d(kernel_size=2, stride=2)
+        super(UpBlock, self).__init__()
         self.convblock = nn.Sequential(
-            DSConv(in_ch, out_ch),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
-            CvBlock(out_ch, out_ch)
+            CvBlock(in_ch, in_ch),
+            DSConv(in_ch, out_ch * 4),
+            nn.PixelShuffle(2)
         )
 
-    def forward(self, x, indices, output_size):
-        x = self.unpool(x, indices, output_size=output_size)
-        x = self.convblock(x)
-        return x
+    def forward(self, x):
+        return self.convblock(x)
 
 
 class OutputCvBlock(nn.Module):
@@ -143,10 +124,7 @@ class OutputCvBlock(nn.Module):
 
 
 class DenBlock(nn.Module):
-    """
-    SegNet-style denoising block for FastDVDnet.
-    Same external interface as before.
-    """
+    """Definition of the denoising block of FastDVDnet."""
     def __init__(self, num_input_frames=3):
         super(DenBlock, self).__init__()
         self.chs_lyr0 = 32
@@ -154,18 +132,10 @@ class DenBlock(nn.Module):
         self.chs_lyr2 = 128
 
         self.inc = InputCvBlock(num_in_frames=num_input_frames, out_ch=self.chs_lyr0)
-
-        # Encoder
-        self.downc0 = SegNetDownBlock(in_ch=self.chs_lyr0, out_ch=self.chs_lyr1)
-        self.downc1 = SegNetDownBlock(in_ch=self.chs_lyr1, out_ch=self.chs_lyr2)
-
-        # Bottleneck refinement
-        self.bottleneck = CvBlock(in_ch=self.chs_lyr2, out_ch=self.chs_lyr2)
-
-        # Decoder
-        self.upc2 = SegNetUpBlock(in_ch=self.chs_lyr2, out_ch=self.chs_lyr1)
-        self.upc1 = SegNetUpBlock(in_ch=self.chs_lyr1, out_ch=self.chs_lyr0)
-
+        self.downc0 = DownBlock(in_ch=self.chs_lyr0, out_ch=self.chs_lyr1)
+        self.downc1 = DownBlock(in_ch=self.chs_lyr1, out_ch=self.chs_lyr2)
+        self.upc2 = UpBlock(in_ch=self.chs_lyr2, out_ch=self.chs_lyr1)
+        self.upc1 = UpBlock(in_ch=self.chs_lyr1, out_ch=self.chs_lyr0)
         self.outc = OutputCvBlock(in_ch=self.chs_lyr0, out_ch=3)
 
         self.reset_params()
@@ -180,24 +150,16 @@ class DenBlock(nn.Module):
             self.weight_init(m)
 
     def forward(self, in0, in1, in2, noise_map):
-        # Input fusion
         x0 = self.inc(torch.cat((in0, noise_map, in1, noise_map, in2, noise_map), dim=1))
 
-        # Encoder
-        x1, idx1, size1 = self.downc0(x0)   # -> 64 ch, pooled
-        x2, idx2, size2 = self.downc1(x1)   # -> 128 ch, pooled
+        x1 = self.downc0(x0)
+        x2 = self.downc1(x1)
 
-        # Bottleneck
-        x = self.bottleneck(x2)
+        x2 = self.upc2(x2)
+        x1 = self.upc1(x1 + x2)
 
-        # Decoder
-        x = self.upc2(x, idx2, size2)       # 128 -> 64, unpool to size2
-        x = self.upc1(x, idx1, size1)       # 64 -> 32, unpool to size1
+        x = self.outc(x0 + x1)
 
-        # Output estimation
-        x = self.outc(x)
-
-        # Residual
         x = in1 - x
         return x
 
@@ -219,13 +181,13 @@ class FastDVDnet(nn.Module):
             self.weight_init(m)
 
     def forward(self, x, noise_map):
-        # x: [N, 9, H, W] because 3 RGB frames
         x0, x1, x2 = tuple(x[:, 3*m:3*m+3, :, :] for m in range(self.num_input_frames))
         x = self.temp(x0, x1, x2, noise_map)
         return x
 
 
 if __name__ == "__main__":
+    from torchinfo import summary
     model = FastDVDnet()
     print(model)
 

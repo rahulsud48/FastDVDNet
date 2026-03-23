@@ -24,3 +24,10 @@ results_data_1d/
 .gitignore
 logs_1d_conv/
 log_3frame_overfit/
+logs_dw_1/
+logs_segnet/
+results_logs_dw_pt/
+logs_dw_pt/
+results_logs_segnet/
+results_logs_dw_1/
+logs_dw_1/

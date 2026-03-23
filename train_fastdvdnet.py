@@ -6,7 +6,7 @@ import argparse
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from models import FastDVDnet
+from models_old import FastDVDnet
 from dataset import ValDataset
 # from dataloaders import train_dali_loader
 from simple_dataloader import train_simple_loader
