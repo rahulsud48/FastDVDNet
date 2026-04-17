@@ -31,3 +31,8 @@ logs_dw_pt/
 results_logs_segnet/
 results_logs_dw_1/
 logs_dw_1/
+fastdvdnet_nhwc.onnx
+fastdvdnet.onnx
+logs_argmax/
+logs_argmax_transpose2d/
+logs_full_model/

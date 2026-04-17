@@ -8,7 +8,27 @@ No no_orthog changes introduced.
 
 import torch
 import torch.nn as nn
+import time
 
+class ChannelToSpace(nn.Module):
+    def __init__(self, scale=2):
+        super().__init__()
+        self.scale = scale
+
+    def forward(self, x):
+        N, C, H, W = x.shape
+        num_positions = self.scale * self.scale
+
+        assert C % num_positions == 0, \
+            f"Channels {C} must be divisible by scale^2={num_positions}"
+
+        g = C // num_positions  # inferred dynamically: 256//4 = 64
+
+        chunks = x.view(N, num_positions, g, H, W)
+        chunks = chunks.view(N, self.scale, self.scale, g, H, W)
+        chunks = chunks.permute(0, 3, 4, 1, 5, 2)
+        out = chunks.contiguous().view(N, g, H * self.scale, W * self.scale)
+        return out
 
 
 class DSConv(nn.Module):
@@ -68,10 +88,10 @@ class InputCvBlock(nn.Module):
                 groups=num_in_frames,
                 bias=False
             ),
-            nn.BatchNorm2d(num_in_frames * self.interm_ch),
+            # nn.BatchNorm2d(num_in_frames * self.interm_ch),
             nn.ReLU(inplace=True),
             DSConv(num_in_frames * self.interm_ch, out_ch),
-            nn.BatchNorm2d(out_ch),
+            # nn.BatchNorm2d(out_ch),
             nn.ReLU(inplace=True)
         )
 
@@ -85,7 +105,7 @@ class DownBlock(nn.Module):
         super(DownBlock, self).__init__()
         self.convblock = nn.Sequential(
             DSConv(in_ch, out_ch, stride=2),
-            nn.BatchNorm2d(out_ch),
+            # nn.BatchNorm2d(out_ch),
             nn.ReLU(inplace=True),
             CvBlock(out_ch, out_ch)
         )
@@ -101,7 +121,8 @@ class UpBlock(nn.Module):
         self.convblock = nn.Sequential(
             CvBlock(in_ch, in_ch),
             DSConv(in_ch, out_ch * 4),
-            nn.PixelShuffle(2)
+            ChannelToSpace(scale=2)
+            # nn.PixelShuffle(2)
         )
 
     def forward(self, x):
@@ -114,7 +135,7 @@ class OutputCvBlock(nn.Module):
         super(OutputCvBlock, self).__init__()
         self.convblock = nn.Sequential(
             DSConv(in_ch, in_ch),
-            nn.BatchNorm2d(in_ch),
+            # nn.BatchNorm2d(in_ch),
             nn.ReLU(inplace=True),
             DSConv(in_ch, out_ch)
         )
@@ -135,8 +156,8 @@ class DenBlock(nn.Module):
         self.downc0 = DownBlock(in_ch=self.chs_lyr0, out_ch=self.chs_lyr1)
         self.downc1 = DownBlock(in_ch=self.chs_lyr1, out_ch=self.chs_lyr2)
         self.upc2 = UpBlock(in_ch=self.chs_lyr2, out_ch=self.chs_lyr1)
-        self.upc1 = UpBlock(in_ch=self.chs_lyr1, out_ch=self.chs_lyr0)
-        self.outc = OutputCvBlock(in_ch=self.chs_lyr0, out_ch=3)
+        self.upc1 = UpBlock(in_ch=self.chs_lyr1*2, out_ch=self.chs_lyr0)
+        self.outc = OutputCvBlock(in_ch=self.chs_lyr0*2, out_ch=3)
 
         self.reset_params()
 
@@ -156,9 +177,11 @@ class DenBlock(nn.Module):
         x2 = self.downc1(x1)
 
         x2 = self.upc2(x2)
-        x1 = self.upc1(x1 + x2)
+        # x1 = self.upc1(x1 + x2)
+        x1 = self.upc1(torch.cat((x1, x2), dim = 1))
 
-        x = self.outc(x0 + x1)
+        # x = self.outc(x0 + x1)
+        x = self.outc(torch.cat((x0, x1), dim = 1))
 
         x = in1 - x
         return x
@@ -187,50 +210,32 @@ class FastDVDnet(nn.Module):
 
 
 if __name__ == "__main__":
-    # import onnx
-    # import onnxruntime as ort
-    import numpy as np
     from torchinfo import summary
- 
-    model = FastDVDnet()
-    print(model)
- 
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    model = FastDVDnet().to(device)
+    model.eval()
+
+    input_data = torch.randn(1, 9, 1080, 1920).to(device)
+    noise_map = torch.randn(1, 1, 1080, 1920).to(device)
+
+    start_time = time.time()
+
+    with torch.no_grad():
+        output_data = model(input_data, noise_map)
+
+    torch.cuda.synchronize()
+
+    end_time = time.time()
+
+    print("Using device:", device)
+    print("Time taken:", end_time - start_time)
+    print("Output shape:", output_data.shape)
+
     summary(
         model,
         input_data=(torch.randn(1, 9, 96, 96), torch.randn(1, 1, 96, 96)),
         col_names=["input_size", "output_size", "num_params"],
         depth=5
     )
- 
-    # # --- Export to ONNX ---
-    # model.eval()
-    # dummy_frames    = torch.randn(1, 9, 96, 96)
-    # dummy_noise_map = torch.randn(1, 1, 96, 96)
- 
-    # torch.onnx.export(
-    #     model,
-    #     (dummy_frames, dummy_noise_map),
-    #     "fastdvdnet.onnx",
-    #     opset_version=11,
-    #     input_names=["frames", "noise_map"],
-    #     output_names=["denoised"],
-    #     do_constant_folding=True,
-    # )
- 
-    # onnx.checker.check_model(onnx.load("fastdvdnet.onnx"))
-    # print("ONNX export OK → fastdvdnet.onnx")
- 
-    # # --- Validate PyTorch vs OnnxRuntime ---
-    # np.random.seed(42)
-    # frames_np    = np.random.randn(1, 9, 96, 96).astype(np.float32)
-    # noise_map_np = np.random.randn(1, 1, 96, 96).astype(np.float32)
- 
-    # with torch.no_grad():
-    #     pt_out = model(torch.from_numpy(frames_np), torch.from_numpy(noise_map_np)).numpy()
- 
-    # sess    = ort.InferenceSession("fastdvdnet.onnx", providers=["CPUExecutionProvider"])
-    # ort_out = sess.run(None, {"frames": frames_np, "noise_map": noise_map_np})[0]
- 
-    # max_diff = float(np.max(np.abs(pt_out - ort_out)))
-    # print(f"Max |PyTorch − OnnxRuntime| diff: {max_diff:.2e}  "
-    #       f"({'OK' if max_diff < 1e-4 else 'WARNING'})")
