@@ -123,19 +123,21 @@ class OutputCvBlock(nn.Module):
         return self.convblock(x)
 
 class ChannelAttentionGate(nn.Module):
+    """SE-style channel attention on skip connection"""
     def __init__(self, ch, reduction=8):
         super().__init__()
         self.gate = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(ch, ch // reduction, kernel_size=1, bias=False),
+            nn.AdaptiveAvgPool2d(1),        # squeeze: (N, C, 1, 1)
+            nn.Flatten(),
+            nn.Linear(ch, ch // reduction),
             nn.ReLU(inplace=True),
-            nn.Conv2d(ch // reduction, ch, kernel_size=1, bias=False),
+            nn.Linear(ch // reduction, ch),
             nn.Sigmoid()
         )
 
     def forward(self, skip):
-        w = self.gate(skip)          # (N, C, 1, 1) — no .view() needed
-        return skip * w
+        w = self.gate(skip).view(skip.shape[0], -1, 1, 1)
+        return skip * w  # re-weighted channels
 
 class CrossAttentionSkip(nn.Module):
     """
@@ -169,15 +171,15 @@ class CrossAttentionSkip(nn.Module):
 class CBAM(nn.Module):
     def __init__(self, ch, reduction=8, kernel_size=7):
         super().__init__()
-        # Channel attention — use Conv2d instead of Flatten+Linear
-        # so it works regardless of batch size split across GPUs
+        # Channel attention
         self.channel_attn = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),          # (N, C, 1, 1)
-            nn.Conv2d(ch, ch // reduction, kernel_size=1, bias=False),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(ch, ch // reduction),
             nn.ReLU(inplace=True),
-            nn.Conv2d(ch // reduction, ch, kernel_size=1, bias=False),
+            nn.Linear(ch // reduction, ch),
             nn.Sigmoid()
-        )                                     # output: (N, C, 1, 1), no reshape needed
+        )
         # Spatial attention
         self.spatial_attn = nn.Sequential(
             nn.Conv2d(2, 1, kernel_size=kernel_size, padding=kernel_size//2, bias=False),
@@ -185,10 +187,10 @@ class CBAM(nn.Module):
         )
 
     def forward(self, x):
-        # Channel attention — no .view() needed, already (N, C, 1, 1)
-        ca = self.channel_attn(x)
+        # Channel attention
+        ca = self.channel_attn(x).view(x.shape[0], -1, 1, 1)
         x = x * ca
-        # Spatial attention
+        # Spatial attention (avg + max pool along channels)
         avg_map = x.mean(dim=1, keepdim=True)
         max_map = x.max(dim=1, keepdim=True).values
         sa = self.spatial_attn(torch.cat([avg_map, max_map], dim=1))
@@ -218,7 +220,7 @@ class DenBlock(nn.Module):
         # self.cross0 = CrossAttentionSkip(ch=self.chs_lyr0)
 
         # ── Option 3: CBAM ──────────────────────────────────────────────── INACTIVE
-        self.cbam2 = CBAM(ch=self.chs_lyr1)   # 64ch, not 128ch  # applied at bottleneck (cheapest)
+        self.cbam2 = CBAM(ch=self.chs_lyr2)   # applied at bottleneck (cheapest)
         self.cbam1 = CBAM(ch=self.chs_lyr1)
         self.cbam0 = CBAM(ch=self.chs_lyr0)
 

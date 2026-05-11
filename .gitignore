@@ -36,3 +36,16 @@ fastdvdnet.onnx
 logs_argmax/
 logs_argmax_transpose2d/
 logs_full_model/
+logs_CBAM/
+logs_cbam_test/
+logs_channel_attention_gate/
+logs_channel_attn_gate/
+results_cbam/
+results_channel_attention_gate/
+results_full_model/
+logs_cross_attn_test/
+results_channel_attn_gate/
+logs_cross_attn_se/
+logs_cross_attention_skip/log.txt
+logs_cross_attention_skip/events.out.tfevents.1777891953.25a0fd478946
+logs_cross_attention_skip/events.out.tfevents.1777891921.25a0fd478946
