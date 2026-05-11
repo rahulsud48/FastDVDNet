@@ -1,36 +1,38 @@
 """
-Definition of the FastDVDnet model
-Depthwise-separable version:
-each Conv2d(3x3) is replaced by:
-    depthwise 3x3 + pointwise 1x1
-No no_orthog changes introduced.
+FastDVDnet — Single-frame input with KV Bank cross-attention at bottleneck.
+
+Architecture:
+  • Each frame is encoded independently through the U-Net encoder.
+  • At the bottleneck, a cross-attention layer uses the current frame's features
+    as Q and retrieves context from a rolling KV bank of up to `bank_size` past
+    bottleneck feature maps.
+  • The decoder then reconstructs the denoised frame as usual.
+
+Key design choices:
+  • Spatial pooling before attention keeps cost manageable at high resolutions
+    (e.g. 4K → H/4 × W/4 at bottleneck → pooled to pool_size × pool_size for attn).
+  • KV bank is a simple ring-buffer (KVBank) managed outside the model so that
+    the training loop controls when to reset (scene cuts, start of sequence, etc.).
+  • Bank is updated AFTER attention so the current frame's KV is available for
+    the NEXT frame.
 """
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
+# ---------------------------------------------------------------------------
+# Basic building blocks (depthwise-separable)
+# ---------------------------------------------------------------------------
 
 class DSConv(nn.Module):
-    """Depthwise 3x3 + Pointwise 1x1"""
+    """Depthwise 3×3 + Pointwise 1×1"""
     def __init__(self, in_ch, out_ch, stride=1):
-        super(DSConv, self).__init__()
+        super().__init__()
         self.conv = nn.Sequential(
-            nn.Conv2d(
-                in_ch, in_ch,
-                kernel_size=3,
-                stride=stride,
-                padding=1,
-                groups=in_ch,
-                bias=False
-            ),
-            nn.Conv2d(
-                in_ch, out_ch,
-                kernel_size=1,
-                stride=1,
-                padding=0,
-                bias=False
-            )
+            nn.Conv2d(in_ch, in_ch, 3, stride=stride, padding=1, groups=in_ch, bias=False),
+            nn.Conv2d(in_ch, out_ch, 1, bias=False),
         )
 
     def forward(self, x):
@@ -38,16 +40,12 @@ class DSConv(nn.Module):
 
 
 class CvBlock(nn.Module):
-    """(DSConv => BN => ReLU) x 2"""
+    """(DSConv → BN → ReLU) × 2"""
     def __init__(self, in_ch, out_ch):
-        super(CvBlock, self).__init__()
+        super().__init__()
         self.convblock = nn.Sequential(
-            DSConv(in_ch, out_ch),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
-            DSConv(out_ch, out_ch),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True)
+            DSConv(in_ch, out_ch), nn.BatchNorm2d(out_ch), nn.ReLU(inplace=True),
+            DSConv(out_ch, out_ch), nn.BatchNorm2d(out_ch), nn.ReLU(inplace=True),
         )
 
     def forward(self, x):
@@ -55,24 +53,16 @@ class CvBlock(nn.Module):
 
 
 class InputCvBlock(nn.Module):
-    """(Grouped Conv with num_in_frames groups => BN => ReLU) + (DSConv => BN => ReLU)"""
-    def __init__(self, num_in_frames, out_ch):
-        super(InputCvBlock, self).__init__()
+    """First encoder block — accepts a single frame + noise map (4 channels)."""
+    def __init__(self, out_ch):
+        super().__init__()
         self.interm_ch = 30
+        # Input: 3 (RGB) + 1 (noise map) = 4 channels
         self.convblock = nn.Sequential(
-            nn.Conv2d(
-                num_in_frames * (3 + 1),
-                num_in_frames * self.interm_ch,
-                kernel_size=3,
-                padding=1,
-                groups=num_in_frames,
-                bias=False
-            ),
-            nn.BatchNorm2d(num_in_frames * self.interm_ch),
-            nn.ReLU(inplace=True),
-            DSConv(num_in_frames * self.interm_ch, out_ch),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True)
+            nn.Conv2d(4, self.interm_ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(self.interm_ch), nn.ReLU(inplace=True),
+            DSConv(self.interm_ch, out_ch),
+            nn.BatchNorm2d(out_ch), nn.ReLU(inplace=True),
         )
 
     def forward(self, x):
@@ -80,14 +70,13 @@ class InputCvBlock(nn.Module):
 
 
 class DownBlock(nn.Module):
-    """Downscale + (DSConv => BN => ReLU)*2"""
+    """Stride-2 DSConv → CvBlock"""
     def __init__(self, in_ch, out_ch):
-        super(DownBlock, self).__init__()
+        super().__init__()
         self.convblock = nn.Sequential(
             DSConv(in_ch, out_ch, stride=2),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
-            CvBlock(out_ch, out_ch)
+            nn.BatchNorm2d(out_ch), nn.ReLU(inplace=True),
+            CvBlock(out_ch, out_ch),
         )
 
     def forward(self, x):
@@ -95,13 +84,13 @@ class DownBlock(nn.Module):
 
 
 class UpBlock(nn.Module):
-    """(DSConv => BN => ReLU)*2 + Upscale"""
+    """CvBlock → DSConv → PixelShuffle ×2"""
     def __init__(self, in_ch, out_ch):
-        super(UpBlock, self).__init__()
+        super().__init__()
         self.convblock = nn.Sequential(
             CvBlock(in_ch, in_ch),
             DSConv(in_ch, out_ch * 4),
-            nn.PixelShuffle(2)
+            nn.PixelShuffle(2),
         )
 
     def forward(self, x):
@@ -109,118 +98,197 @@ class UpBlock(nn.Module):
 
 
 class OutputCvBlock(nn.Module):
-    """DSConv => BN => ReLU => DSConv"""
+    """DSConv → BN → ReLU → DSConv"""
     def __init__(self, in_ch, out_ch):
-        super(OutputCvBlock, self).__init__()
+        super().__init__()
         self.convblock = nn.Sequential(
-            DSConv(in_ch, in_ch),
-            nn.BatchNorm2d(in_ch),
-            nn.ReLU(inplace=True),
-            DSConv(in_ch, out_ch)
+            DSConv(in_ch, in_ch), nn.BatchNorm2d(in_ch), nn.ReLU(inplace=True),
+            DSConv(in_ch, out_ch),
         )
 
     def forward(self, x):
         return self.convblock(x)
 
-class ChannelAttentionGate(nn.Module):
-    def __init__(self, ch, reduction=8):
-        super().__init__()
-        self.gate = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(ch, ch // reduction, kernel_size=1, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(ch // reduction, ch, kernel_size=1, bias=False),
-            nn.Sigmoid()
-        )
-
-    def forward(self, skip):
-        w = self.gate(skip)          # (N, C, 1, 1) — no .view() needed
-        return skip * w
-
-class CrossAttentionSkip(nn.Module):
-    """
-    Q from upblock output, KV from downblock skip.
-    Operates on spatially pooled features to keep cost manageable.
-    """
-    def __init__(self, ch, num_heads=4, pool_size=8):
-        super().__init__()
-        self.pool = nn.AdaptiveAvgPool2d(pool_size)  # compress spatial dims
-        self.to_q = nn.Linear(ch, ch)
-        self.to_kv = nn.Linear(ch, ch * 2)
-        self.attn = nn.MultiheadAttention(ch, num_heads, batch_first=True)
-        self.gate = nn.Sequential(nn.Linear(ch, ch), nn.Sigmoid())
-
-    def forward(self, up_feat, skip_feat):
-        N, C, H, W = skip_feat.shape
-        # Pool and flatten spatial dims → tokens
-        q_pooled = self.pool(up_feat).flatten(2).transpose(1, 2)   # (N, S, C)
-        kv_pooled = self.pool(skip_feat).flatten(2).transpose(1, 2) # (N, S, C)
-
-        q = self.to_q(q_pooled)
-        k, v = self.to_kv(kv_pooled).chunk(2, dim=-1)
-
-        attn_out, _ = self.attn(q, k, v)  # (N, S, C)
-        
-        # Use attention output as a channel gate on the full-res skip
-        gate = self.gate(attn_out.mean(dim=1)).view(N, C, 1, 1)
-        return skip_feat * gate  # modulate full-res skip features
-
 
 class CBAM(nn.Module):
     def __init__(self, ch, reduction=8, kernel_size=7):
         super().__init__()
-        # Channel attention — use Conv2d instead of Flatten+Linear
-        # so it works regardless of batch size split across GPUs
         self.channel_attn = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),          # (N, C, 1, 1)
-            nn.Conv2d(ch, ch // reduction, kernel_size=1, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(ch // reduction, ch, kernel_size=1, bias=False),
-            nn.Sigmoid()
-        )                                     # output: (N, C, 1, 1), no reshape needed
-        # Spatial attention
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(ch, ch // reduction, 1, bias=False), nn.ReLU(inplace=True),
+            nn.Conv2d(ch // reduction, ch, 1, bias=False), nn.Sigmoid(),
+        )
         self.spatial_attn = nn.Sequential(
-            nn.Conv2d(2, 1, kernel_size=kernel_size, padding=kernel_size//2, bias=False),
-            nn.Sigmoid()
+            nn.Conv2d(2, 1, kernel_size, padding=kernel_size // 2, bias=False),
+            nn.Sigmoid(),
         )
 
     def forward(self, x):
-        # Channel attention — no .view() needed, already (N, C, 1, 1)
-        ca = self.channel_attn(x)
-        x = x * ca
-        # Spatial attention
-        avg_map = x.mean(dim=1, keepdim=True)
-        max_map = x.max(dim=1, keepdim=True).values
-        sa = self.spatial_attn(torch.cat([avg_map, max_map], dim=1))
+        x = x * self.channel_attn(x)
+        sa = self.spatial_attn(torch.cat([x.mean(1, keepdim=True),
+                                           x.max(1, keepdim=True).values], dim=1))
         return x * sa
 
+
+# ---------------------------------------------------------------------------
+# KV Bank  (ring buffer, lives outside the model)
+# ---------------------------------------------------------------------------
+
+class KVBank:
+    """
+    Rolling buffer that stores (key, value) tensors from past bottleneck frames.
+
+    Usage:
+        bank = KVBank(bank_size=10)
+        bank.reset()                      # call at sequence start / scene cut
+        kv = bank.get()                   # returns list of (k, v) or [] if empty
+        bank.push(k, v)                   # store current frame's KV after attention
+    
+    Tensors are kept on the same device as the model — no explicit .to() needed
+    because we store whatever device the tensors arrive on.
+    """
+
+    def __init__(self, bank_size: int = 10):
+        self.bank_size = bank_size
+        self._keys: list = []    # list of tensors (N, S, C)
+        self._values: list = []  # list of tensors (N, S, C)
+
+    def reset(self):
+        self._keys.clear()
+        self._values.clear()
+
+    def push(self, k: torch.Tensor, v: torch.Tensor):
+        """k, v: (N, S, C) — spatially pooled & projected bottleneck features."""
+        self._keys.append(k.detach())
+        self._values.append(v.detach())
+        if len(self._keys) > self.bank_size:
+            self._keys.pop(0)
+            self._values.pop(0)
+
+    def get(self):
+        """Returns (keys, values) each of shape (N, T*S, C), or None if empty."""
+        if not self._keys:
+            return None, None
+        keys = torch.cat(self._keys, dim=1)    # (N, T*S, C)
+        values = torch.cat(self._values, dim=1)
+        return keys, values
+
+    def __len__(self):
+        return len(self._keys)
+
+
+# ---------------------------------------------------------------------------
+# Bottleneck cross-attention with KV bank
+# ---------------------------------------------------------------------------
+
+class BottleneckCrossAttn(nn.Module):
+    """
+    Cross-attention at the bottleneck:
+      Q  ← current frame's bottleneck features  (spatially pooled)
+      KV ← concatenated past frames from KVBank (spatially pooled)
+
+    When the bank is empty (first frame of a sequence) we fall through with
+    a simple identity (no temporal context yet).
+
+    Args:
+        ch        : number of bottleneck channels (default 128)
+        num_heads : attention heads
+        pool_size : spatial size after AdaptiveAvgPool2d before attention
+                    (reduces H/4 × W/4 → pool_size × pool_size)
+    """
+
+    def __init__(self, ch: int = 128, num_heads: int = 4, pool_size: int = 8):
+        super().__init__()
+        self.ch = ch
+        self.pool = nn.AdaptiveAvgPool2d(pool_size)
+
+        self.to_q  = nn.Linear(ch, ch, bias=False)
+        self.to_k  = nn.Linear(ch, ch, bias=False)
+        self.to_v  = nn.Linear(ch, ch, bias=False)
+
+        self.attn  = nn.MultiheadAttention(ch, num_heads, batch_first=True)
+
+        # Gate: blend attended context into the full-res bottleneck feature map
+        self.gate  = nn.Sequential(nn.Linear(ch, ch), nn.Sigmoid())
+
+        self.pool_size = pool_size
+
+    def _pool_to_tokens(self, feat):
+        """(N, C, H, W) → (N, S, C) where S = pool_size²"""
+        return self.pool(feat).flatten(2).transpose(1, 2)   # (N, S, C)
+
+    def forward(self, x: torch.Tensor, bank: KVBank):
+        """
+        Args:
+            x    : bottleneck feature map  (N, C, H, W)
+            bank : KVBank instance (may be empty for the first frame)
+        Returns:
+            x_out : (N, C, H, W) — temporally enriched bottleneck features
+            k, v  : (N, S, C)   — current frame's projected K and V
+                                   (caller should push these to the bank)
+        """
+        N, C, H, W = x.shape
+
+        # ── Project current frame ──────────────────────────────────────────
+        q_tokens = self._pool_to_tokens(x)          # (N, S, C)
+        k_cur    = self.to_k(q_tokens)              # (N, S, C)
+        v_cur    = self.to_v(q_tokens)              # (N, S, C)
+        q_cur    = self.to_q(q_tokens)              # (N, S, C)
+
+        # ── If bank is empty, skip cross-attention ─────────────────────────
+        bank_k, bank_v = bank.get()
+        if bank_k is None:
+            # No past context; return features unchanged
+            return x, k_cur, v_cur
+
+        # ── Cross-attention: Q=current, KV=past ───────────────────────────
+        attn_out, _ = self.attn(q_cur, bank_k, bank_v)  # (N, S, C)
+
+        # ── Gate: modulate full-res feature map ───────────────────────────
+        gate = self.gate(attn_out.mean(dim=1))      # (N, C)
+        gate = gate.view(N, C, 1, 1)               # broadcast over spatial dims
+        x_out = x * gate + x                       # residual gating
+
+        return x_out, k_cur, v_cur
+
+
+# ---------------------------------------------------------------------------
+# Main denoising block (single-frame input)
+# ---------------------------------------------------------------------------
+
 class DenBlock(nn.Module):
-    """Definition of the denoising block of FastDVDnet."""
-    def __init__(self, num_input_frames=3):
-        super(DenBlock, self).__init__()
+    """
+    U-Net denoising block with:
+      • Single-frame input  (frame_t + noise_map → 4 channels)
+      • KV bank cross-attention at the bottleneck
+      • CBAM on skip connections
+    """
+    def __init__(self, bank_size: int = 10, num_heads: int = 4, pool_size: int = 8):
+        super().__init__()
         self.chs_lyr0 = 32
         self.chs_lyr1 = 64
         self.chs_lyr2 = 128
 
-        self.inc = InputCvBlock(num_in_frames=num_input_frames, out_ch=self.chs_lyr0)
-        self.downc0 = DownBlock(in_ch=self.chs_lyr0, out_ch=self.chs_lyr1)
-        self.downc1 = DownBlock(in_ch=self.chs_lyr1, out_ch=self.chs_lyr2)
-        self.upc2 = UpBlock(in_ch=self.chs_lyr2, out_ch=self.chs_lyr1)
-        self.upc1 = UpBlock(in_ch=self.chs_lyr1, out_ch=self.chs_lyr0)
-        self.outc = OutputCvBlock(in_ch=self.chs_lyr0, out_ch=3)
+        # ── Encoder ───────────────────────────────────────────────────────
+        self.inc    = InputCvBlock(out_ch=self.chs_lyr0)
+        self.downc0 = DownBlock(self.chs_lyr0, self.chs_lyr1)
+        self.downc1 = DownBlock(self.chs_lyr1, self.chs_lyr2)
 
-        # ── Option 1: Channel Attention Gate (SE-style) ─────────────────── ACTIVE
-        # self.ca1 = ChannelAttentionGate(ch=self.chs_lyr1)
-        # self.ca0 = ChannelAttentionGate(ch=self.chs_lyr0)
+        # ── Bottleneck cross-attention ────────────────────────────────────
+        self.kv_attn = BottleneckCrossAttn(
+            ch=self.chs_lyr2,
+            num_heads=num_heads,
+            pool_size=pool_size,
+        )
 
-        # ── Option 2: Cross-Attention Skip ──────────────────────────────── INACTIVE
-        # self.cross1 = CrossAttentionSkip(ch=self.chs_lyr1)
-        # self.cross0 = CrossAttentionSkip(ch=self.chs_lyr0)
+        # ── Decoder ───────────────────────────────────────────────────────
+        self.upc2 = UpBlock(self.chs_lyr2, self.chs_lyr1)
+        self.upc1 = UpBlock(self.chs_lyr1, self.chs_lyr0)
+        self.outc = OutputCvBlock(self.chs_lyr0, 3)
 
-        # ── Option 3: CBAM ──────────────────────────────────────────────── INACTIVE
-        self.cbam2 = CBAM(ch=self.chs_lyr1)   # 64ch, not 128ch  # applied at bottleneck (cheapest)
-        self.cbam1 = CBAM(ch=self.chs_lyr1)
-        self.cbam0 = CBAM(ch=self.chs_lyr0)
+        # ── Skip-connection attention (CBAM) ──────────────────────────────
+        self.cbam1 = CBAM(self.chs_lyr1)
+        self.cbam0 = CBAM(self.chs_lyr0)
 
         self.reset_params()
 
@@ -230,50 +298,54 @@ class DenBlock(nn.Module):
             nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
 
     def reset_params(self):
-        for _, m in enumerate(self.modules()):
+        for m in self.modules():
             self.weight_init(m)
 
-    def forward(self, in0, in1, in2, noise_map):
-        x0 = self.inc(torch.cat((in0, noise_map, in1, noise_map, in2, noise_map), dim=1))
-        x1 = self.downc0(x0)
-        x2 = self.downc1(x1)
+    def forward(self, frame_t: torch.Tensor, noise_map: torch.Tensor, bank: KVBank):
+        """
+        Args:
+            frame_t   : (N, 3, H, W)  noisy current frame in [0, 1]
+            noise_map : (N, 1, H, W)  per-image noise std map
+            bank      : KVBank        rolling buffer of past K/V tensors
 
-        x2 = self.upc2(x2)
+        Returns:
+            denoised  : (N, 3, H, W)
+        """
+        # ── Encoder ───────────────────────────────────────────────────────
+        x0 = self.inc(torch.cat([frame_t, noise_map], dim=1))  # (N, 32, H,   W  )
+        x1 = self.downc0(x0)                                   # (N, 64, H/2, W/2)
+        x2 = self.downc1(x1)                                   # (N,128, H/4, W/4)
 
-        # ── Option 1: Channel Attention Gate ────────────────────────────── ACTIVE
-        # Re-weights skip connection channels before adding upsampled features.
-        # ca1 learns which channels of x1 are most informative given noise level.
-        # x1 = self.upc1(self.ca1(x1) + x2)
+        # ── Bottleneck cross-attention ────────────────────────────────────
+        x2, k_cur, v_cur = self.kv_attn(x2, bank)
 
-        # ── Option 2: Cross-Attention Skip ──────────────────────────────── INACTIVE
-        # Q from upc2 output (x2), KV from downblock skip (x1).
-        # Lets upsampled features query which parts of the skip are relevant.
-        # x1 = self.upc1(self.cross1(up_feat=x2, skip_feat=x1) + x2)
+        # Update bank with current frame's KV (available for next frame)
+        bank.push(k_cur, v_cur)
 
-        # ── Option 3: CBAM ──────────────────────────────────────────────── INACTIVE
-        # Apply spatial + channel attention on the bottleneck (x2) where maps
-        # are smallest (H/4 x W/4), then plain residual add for skip connections.
-        x2 = self.cbam2(x2)
-        x1 = self.upc1(self.cbam1(x1) + x2)
+        # ── Decoder ───────────────────────────────────────────────────────
+        x2 = self.upc2(x2)                                     # (N, 64, H/2, W/2)
+        x1 = self.upc1(self.cbam1(x1) + x2)                   # (N, 32, H,   W  )
+        x  = self.outc(self.cbam0(x0) + x1)                   # (N,  3, H,   W  )
 
-        # ── shared output block (all options) ───────────────────────────────────
-        # x = self.outc(self.ca0(x0) + x1)   # Option 1: attended x0 skip
+        # Residual learning: predict noise, subtract from input
+        return frame_t - x
 
-        # Option 2 output:
-        # x = self.outc(self.cross0(up_feat=x1, skip_feat=x0) + x1)
 
-        # Option 3 output:
-        x = self.outc(self.cbam0(x0) + x1)
-
-        x = in1 - x
-        return x
-
+# ---------------------------------------------------------------------------
+# Top-level model
+# ---------------------------------------------------------------------------
 
 class FastDVDnet(nn.Module):
-    def __init__(self, num_input_frames=3):
-        super(FastDVDnet, self).__init__()
-        self.num_input_frames = num_input_frames
-        self.temp = DenBlock(num_input_frames=3)
+    """
+    Single-frame-input FastDVDnet with temporal KV bank.
+
+    The model itself is stateless — the KVBank is passed in at each forward
+    call so the training loop fully controls temporal state (resets, batching).
+    """
+    def __init__(self, bank_size: int = 10, num_heads: int = 4, pool_size: int = 8):
+        super().__init__()
+        self.bank_size = bank_size
+        self.temp = DenBlock(bank_size=bank_size, num_heads=num_heads, pool_size=pool_size)
         self.reset_params()
 
     @staticmethod
@@ -282,60 +354,49 @@ class FastDVDnet(nn.Module):
             nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
 
     def reset_params(self):
-        for _, m in enumerate(self.modules()):
+        for m in self.modules():
             self.weight_init(m)
 
-    def forward(self, x, noise_map):
-        x0, x1, x2 = tuple(x[:, 3*m:3*m+3, :, :] for m in range(self.num_input_frames))
-        x = self.temp(x0, x1, x2, noise_map)
-        return x
+    def forward(self, frame_t: torch.Tensor, noise_map: torch.Tensor, bank: KVBank):
+        """
+        Args:
+            frame_t   : (N, 3, H, W)
+            noise_map : (N, 1, H, W)
+            bank      : KVBank  (shared across frames in a sequence)
+        Returns:
+            denoised  : (N, 3, H, W)
+        """
+        return self.temp(frame_t, noise_map, bank)
 
+
+# ---------------------------------------------------------------------------
+# Quick sanity check
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # import onnx
-    # import onnxruntime as ort
-    import numpy as np
     from torchinfo import summary
- 
-    model = FastDVDnet()
+
+    bank_size = 10
+    model = FastDVDnet(bank_size=bank_size, num_heads=4, pool_size=8)
     print(model)
- 
+
+    # Simulate a short sequence
+    bank = KVBank(bank_size=bank_size)
+    model.eval()
+    with torch.no_grad():
+        for t in range(5):
+            frame     = torch.randn(1, 3, 96, 96)
+            noise_map = torch.randn(1, 1, 96, 96)
+            out = model(frame, noise_map, bank)
+            print(f"t={t}  bank_len={len(bank)}  out={out.shape}")
+
     summary(
         model,
-        input_data=(torch.randn(1, 9, 96, 96), torch.randn(1, 1, 96, 96)),
+        input_data=(
+            torch.randn(1, 3, 96, 96),
+            torch.randn(1, 1, 96, 96),
+            KVBank(bank_size=bank_size),
+        ),
         col_names=["input_size", "output_size", "num_params"],
-        depth=5
+        depth=5,
     )
- 
-    # # --- Export to ONNX ---
-    # model.eval()
-    # dummy_frames    = torch.randn(1, 9, 96, 96)
-    # dummy_noise_map = torch.randn(1, 1, 96, 96)
- 
-    # torch.onnx.export(
-    #     model,
-    #     (dummy_frames, dummy_noise_map),
-    #     "fastdvdnet.onnx",
-    #     opset_version=11,
-    #     input_names=["frames", "noise_map"],
-    #     output_names=["denoised"],
-    #     do_constant_folding=True,
-    # )
- 
-    # onnx.checker.check_model(onnx.load("fastdvdnet.onnx"))
-    # print("ONNX export OK → fastdvdnet.onnx")
- 
-    # # --- Validate PyTorch vs OnnxRuntime ---
-    # np.random.seed(42)
-    # frames_np    = np.random.randn(1, 9, 96, 96).astype(np.float32)
-    # noise_map_np = np.random.randn(1, 1, 96, 96).astype(np.float32)
- 
-    # with torch.no_grad():
-    #     pt_out = model(torch.from_numpy(frames_np), torch.from_numpy(noise_map_np)).numpy()
- 
-    # sess    = ort.InferenceSession("fastdvdnet.onnx", providers=["CPUExecutionProvider"])
-    # ort_out = sess.run(None, {"frames": frames_np, "noise_map": noise_map_np})[0]
- 
-    # max_diff = float(np.max(np.abs(pt_out - ort_out)))
-    # print(f"Max |PyTorch − OnnxRuntime| diff: {max_diff:.2e}  "
-    #       f"({'OK' if max_diff < 1e-4 else 'WARNING'})")

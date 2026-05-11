@@ -49,3 +49,4 @@ logs_cross_attn_se/
 logs_cross_attention_skip/log.txt
 logs_cross_attention_skip/events.out.tfevents.1777891953.25a0fd478946
 logs_cross_attention_skip/events.out.tfevents.1777891921.25a0fd478946
+logs_kv_bank/
