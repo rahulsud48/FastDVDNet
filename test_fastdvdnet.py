@@ -1,164 +1,220 @@
-#!/bin/sh
+#!/usr/bin/env python3
 """
-Denoise all the sequences existent in a given folder using FastDVDnet.
+Denoise all sequences in a given folder using FastDVDnet (single-frame + KV bank).
+
+Each sequence is denoised frame-by-frame in temporal order.
+A fresh KVBank is created per sequence so context doesn't bleed across clips.
 """
+
 import os
 import argparse
 import time
+
 import cv2
 import torch
 import torch.nn as nn
-from models import FastDVDnet
-from fastdvdnet import denoise_seq_fastdvdnet
-from utils import batch_psnr, init_logger_test, \
-				variable_to_cv2_image, remove_dataparallel_wrapper, open_sequence, close_logger
 
-NUM_IN_FR_EXT = 5 # temporal size of patch
-MC_ALGO = 'DeepFlow' # motion estimation algorithm
-OUTIMGEXT = '.png' # output images format
+from models import FastDVDnet, KVBank
+from fastdvdnet import denoise_seq_fastdvdnet
+from utils import (batch_psnr, init_logger_test,
+                   variable_to_cv2_image, remove_dataparallel_wrapper,
+                   open_sequence, close_logger)
+
+OUTIMGEXT = '.png'
+
+
+# ---------------------------------------------------------------------------
+# Save outputs
+# ---------------------------------------------------------------------------
 
 def save_out_seq(seqnoisy, seqclean, save_dir, sigmaval, suffix, save_noisy):
-	"""Saves the denoised and noisy sequences under save_dir
-	"""
-	seq_len = seqnoisy.size()[0]
-	for idx in range(seq_len):
-		# Build Outname
-		fext = OUTIMGEXT
-		noisy_name = os.path.join(save_dir,\
-						('n{}_{}').format(sigmaval, idx) + fext)
-		if len(suffix) == 0:
-			out_name = os.path.join(save_dir,\
-					('n{}_FastDVDnet_{}').format(sigmaval, idx) + fext)
-		else:
-			out_name = os.path.join(save_dir,\
-					('n{}_FastDVDnet_{}_{}').format(sigmaval, suffix, idx) + fext)
+    """Saves denoised (and optionally noisy) frames under save_dir."""
+    seq_len = seqnoisy.size()[0]
+    for idx in range(seq_len):
+        noisy_name = os.path.join(save_dir,
+                                  'n{}_{}'.format(sigmaval, idx) + OUTIMGEXT)
+        if len(suffix) == 0:
+            out_name = os.path.join(save_dir,
+                                    'n{}_FastDVDnet_{}'.format(sigmaval, idx) + OUTIMGEXT)
+        else:
+            out_name = os.path.join(save_dir,
+                                    'n{}_FastDVDnet_{}_{}'.format(sigmaval, suffix, idx) + OUTIMGEXT)
 
-		# Save result
-		if save_noisy:
-			noisyimg = variable_to_cv2_image(seqnoisy[idx].clamp(0., 1.))
-			cv2.imwrite(noisy_name, noisyimg)
+        if save_noisy:
+            noisyimg = variable_to_cv2_image(seqnoisy[idx].clamp(0., 1.))
+            cv2.imwrite(noisy_name, noisyimg)
 
-		outimg = variable_to_cv2_image(seqclean[idx].unsqueeze(dim=0))
-		cv2.imwrite(out_name, outimg)
+        outimg = variable_to_cv2_image(seqclean[idx].unsqueeze(dim=0))
+        cv2.imwrite(out_name, outimg)
+
+
+# ---------------------------------------------------------------------------
+# Main test function
+# ---------------------------------------------------------------------------
 
 def test_fastdvdnet(**args):
-	"""Denoises all sequences present in a given folder. Sequences must be stored as numbered
-	image sequences. The different sequences must be stored in subfolders under the "test_path" folder.
+    """
+    Denoises all sequences present in a given folder.
+    Sequences must be stored as numbered image sequences in subfolders
+    under args['test_path'].
+    """
+    start_time = time.time()
 
-	Inputs:
-		args (dict) fields:
-			"model_file": path to model
-			"test_path": path to sequence to denoise
-			"suffix": suffix to add to output name
-			"max_num_fr_per_seq": max number of frames to load per sequence
-			"noise_sigma": noise level used on test set
-			"dont_save_results: if True, don't save output images
-			"no_gpu": if True, run model on CPU
-			"save_path": where to save outputs as png
-			"gray": if True, perform denoising of grayscale images instead of RGB
-	"""
-	# Start time
-	start_time = time.time()
+    if not os.path.exists(args['save_path']):
+        os.makedirs(args['save_path'])
+    logger = init_logger_test(args['save_path'])
 
-	# If save_path does not exist, create it
-	if not os.path.exists(args['save_path']):
-		os.makedirs(args['save_path'])
-	logger = init_logger_test(args['save_path'])
+    device = torch.device('cuda') if args['cuda'] else torch.device('cpu')
 
-	# Sets data type according to CPU or GPU modes
-	if args['cuda']:
-		device = torch.device('cuda')
-	else:
-		device = torch.device('cpu')
+    # ── Load model ────────────────────────────────────────────────────────
+    print('Loading model ...')
+    model_temp = FastDVDnet(
+        bank_size=args['bank_size'],
+        num_heads=args['num_heads'],
+        pool_size=args['pool_size'],
+    )
 
-	# Create models
-	print('Loading models ...')
-	model_temp = FastDVDnet(num_input_frames=3)
+    state_dict = torch.load(args['model_file'], map_location=device)
+    if args['cuda']:
+        model_temp = nn.DataParallel(model_temp, device_ids=[0]).cuda()
+    else:
+        state_dict = remove_dataparallel_wrapper(state_dict)
+    model_temp.load_state_dict(state_dict)
+    model_temp.eval()
 
-	# Load saved weights
-	state_temp_dict = torch.load(args['model_file'], map_location=device)
-	if args['cuda']:
-		device_ids = [0]
-		model_temp = nn.DataParallel(model_temp, device_ids=device_ids).cuda()
-	else:
-		# CPU mode: remove the DataParallel wrapper
-		state_temp_dict = remove_dataparallel_wrapper(state_temp_dict)
-	model_temp.load_state_dict(state_temp_dict)
+    # ── Find all sequence subfolders ──────────────────────────────────────
+    seq_dirs = sorted([
+        os.path.join(args['test_path'], d)
+        for d in os.listdir(args['test_path'])
+        if os.path.isdir(os.path.join(args['test_path'], d))
+    ])
 
-	# Sets the model in evaluation mode (e.g. it removes BN)
-	model_temp.eval()
+    if not seq_dirs:
+        # test_path itself is a single sequence
+        seq_dirs = [args['test_path']]
 
-	with torch.no_grad():
-		# process data
-		seq, _, _ = open_sequence(args['test_path'],\
-									args['gray'],\
-									expand_if_needed=False,\
-									max_num_fr=args['max_num_fr_per_seq'])
-		seq = torch.from_numpy(seq).to(device)
-		seq_time = time.time()
+    psnr_all = []
 
-		# Add noise
-		noise = torch.empty_like(seq).normal_(mean=0, std=args['noise_sigma']).to(device)
-		seqn = seq + noise
-		noisestd = torch.FloatTensor([args['noise_sigma']]).to(device)
+    with torch.no_grad():
+        for seq_dir in seq_dirs:
+            seq_start = time.time()
 
-		denframes = denoise_seq_fastdvdnet(seq=seqn,\
-										noise_std=noisestd,\
-										temp_psz=NUM_IN_FR_EXT,\
-										model_temporal=model_temp)
+            # Load sequence
+            seq, _, _ = open_sequence(
+                seq_dir,
+                args['gray'],
+                expand_if_needed=False,
+                max_num_fr=args['max_num_fr_per_seq'],
+            )
+            seq = torch.from_numpy(seq).to(device)   # (T, C, H, W) in [0, 1]
+            seq_load_time = time.time() - seq_start
 
-	# Compute PSNR and log it
-	stop_time = time.time()
-	psnr = batch_psnr(denframes, seq, 1.)
-	psnr_noisy = batch_psnr(seqn.squeeze(), seq, 1.)
-	loadtime = (seq_time - start_time)
-	runtime = (stop_time - seq_time)
-	seq_length = seq.size()[0]
-	logger.info("Finished denoising {}".format(args['test_path']))
-	logger.info("\tDenoised {} frames in {:.3f}s, loaded seq in {:.3f}s".\
-				 format(seq_length, runtime, loadtime))
-	logger.info("\tPSNR noisy {:.4f}dB, PSNR result {:.4f}dB".format(psnr_noisy, psnr))
+            # Add Gaussian noise
+            noise  = torch.empty_like(seq).normal_(mean=0, std=args['noise_sigma'])
+            seqn   = (seq + noise).clamp(0., 1.)
+            noisestd = torch.FloatTensor([args['noise_sigma']]).to(device)
 
-	# Save outputs
-	if not args['dont_save_results']:
-		# Save sequence
-		save_out_seq(seqn, denframes, args['save_path'], \
-					   int(args['noise_sigma']*255), args['suffix'], args['save_noisy'])
+            # ── Denoise frame-by-frame with a fresh KV bank ───────────────
+            # denoise_seq_fastdvdnet creates a new KVBank internally per call,
+            # so each sequence gets independent temporal context.
+            denframes = denoise_seq_fastdvdnet(
+                seq=seqn,
+                noise_std=noisestd,
+                temp_psz=None,                  # unused — bank handles temporal context
+                model_temporal=model_temp,
+                bank_size=args['bank_size'],
+            )
 
-	# close logger
-	close_logger(logger)
+            seq_run_time = time.time() - seq_start - seq_load_time
+
+            # ── Metrics ───────────────────────────────────────────────────
+            psnr       = batch_psnr(denframes, seq, 1.)
+            psnr_noisy = batch_psnr(seqn.squeeze(), seq, 1.)
+            psnr_all.append(psnr)
+
+            seq_length = seq.size(0)
+            logger.info("Finished denoising {}".format(seq_dir))
+            logger.info("\tFrames: {}  |  Load: {:.3f}s  |  Denoise: {:.3f}s".format(
+                seq_length, seq_load_time, seq_run_time))
+            logger.info("\tPSNR noisy: {:.4f} dB  |  PSNR denoised: {:.4f} dB".format(
+                psnr_noisy, psnr))
+
+            # ── Save outputs ──────────────────────────────────────────────
+            if not args['dont_save_results']:
+                seq_save_dir = os.path.join(args['save_path'],
+                                            os.path.basename(seq_dir.rstrip('/')))
+                os.makedirs(seq_save_dir, exist_ok=True)
+                save_out_seq(
+                    seqn, denframes,
+                    seq_save_dir,
+                    int(args['noise_sigma'] * 255),
+                    args['suffix'],
+                    args['save_noisy'],
+                )
+
+    # ── Summary ───────────────────────────────────────────────────────────
+    if psnr_all:
+        avg_psnr = sum(psnr_all) / len(psnr_all)
+        logger.info("\n=== Average PSNR over {} sequences: {:.4f} dB ===".format(
+            len(psnr_all), avg_psnr))
+        print("\n=== Average PSNR: {:.4f} dB ===".format(avg_psnr))
+
+    elapsed = time.time() - start_time
+    logger.info("Total elapsed time: {}".format(
+        time.strftime("%H:%M:%S", time.gmtime(elapsed))))
+    close_logger(logger)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-	# Parse arguments
-	parser = argparse.ArgumentParser(description="Denoise a sequence with FastDVDnet")
-	parser.add_argument("--model_file", type=str,\
-						default="./model.pth", \
-						help='path to model of the pretrained denoiser')
-	parser.add_argument("--test_path", type=str, default="./data/rgb/Kodak24", \
-						help='path to sequence to denoise')
-	parser.add_argument("--suffix", type=str, default="", help='suffix to add to output name')
-	parser.add_argument("--max_num_fr_per_seq", type=int, default=25, \
-						help='max number of frames to load per sequence')
-	parser.add_argument("--noise_sigma", type=float, default=25, help='noise level used on test set')
-	parser.add_argument("--dont_save_results", action='store_true', help="don't save output images")
-	parser.add_argument("--save_noisy", action='store_true', help="save noisy frames")
-	parser.add_argument("--no_gpu", action='store_true', help="run model on CPU")
-	parser.add_argument("--save_path", type=str, default='./results', \
-						 help='where to save outputs as png')
-	parser.add_argument("--gray", action='store_true',\
-						help='perform denoising of grayscale images instead of RGB')
 
-	argspar = parser.parse_args()
-	# Normalize noises ot [0, 1]
-	argspar.noise_sigma /= 255.
+    parser = argparse.ArgumentParser(description="Denoise sequences with FastDVDnet (KV bank)")
 
-	# use CUDA?
-	argspar.cuda = not argspar.no_gpu and torch.cuda.is_available()
+    # I/O
+    parser.add_argument("--model_file",         type=str, default="./model.pth",
+                        help="Path to trained model checkpoint")
+    parser.add_argument("--test_path",          type=str, default="./data/rgb/Kodak24",
+                        help="Path to folder containing sequence subfolders")
+    parser.add_argument("--save_path",          type=str, default="./results",
+                        help="Where to save output images")
+    parser.add_argument("--suffix",             type=str, default="",
+                        help="Suffix to add to output filenames")
+    parser.add_argument("--max_num_fr_per_seq", type=int, default=25,
+                        help="Max frames to load per sequence")
 
-	print("\n### Testing FastDVDnet model ###")
-	print("> Parameters:")
-	for p, v in zip(argspar.__dict__.keys(), argspar.__dict__.values()):
-		print('\t{}: {}'.format(p, v))
-	print('\n')
+    # Noise
+    parser.add_argument("--noise_sigma",        type=float, default=25,
+                        help="Noise std used for testing (will be divided by 255)")
 
-	test_fastdvdnet(**vars(argspar))
+    # KV bank (must match training settings)
+    parser.add_argument("--bank_size",          type=int, default=10,
+                        help="KV bank capacity — must match training")
+    parser.add_argument("--num_heads",          type=int, default=4,
+                        help="Attention heads — must match training")
+    parser.add_argument("--pool_size",          type=int, default=8,
+                        help="Spatial pool size — must match training")
+
+    # Misc
+    parser.add_argument("--dont_save_results",  action='store_true',
+                        help="Skip saving output images")
+    parser.add_argument("--save_noisy",         action='store_true',
+                        help="Also save noisy input frames")
+    parser.add_argument("--no_gpu",             action='store_true',
+                        help="Run on CPU")
+    parser.add_argument("--gray",               action='store_true',
+                        help="Denoise grayscale instead of RGB")
+
+    argspar = parser.parse_args()
+
+    argspar.noise_sigma /= 255.
+    argspar.cuda = not argspar.no_gpu and torch.cuda.is_available()
+
+    print("\n### Testing FastDVDnet (single-frame + KV bank) ###")
+    for p, v in zip(argspar.__dict__.keys(), argspar.__dict__.values()):
+        print('\t{}: {}'.format(p, v))
+    print('\n')
+
+    test_fastdvdnet(**vars(argspar))
