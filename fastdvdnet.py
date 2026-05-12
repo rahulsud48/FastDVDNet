@@ -1,29 +1,29 @@
 """
-FastDVDnet denoising algorithm
-
-@author: Matias Tassano <mtassano@parisdescartes.fr>
+FastDVDnet denoising algorithm — single-frame + KV bank variant.
 """
 import torch
 import torch.nn.functional as F
+from models import KVBank
 
-def temp_denoise(model, noisyframe, sigma_noise):
-	'''Encapsulates call to denoising model and handles padding.
-		Expects noisyframe to be normalized in [0., 1.]
-	'''
-	# make size a multiple of four (we have two scales in the denoiser)
+
+def temp_denoise(model, noisyframe, sigma_noise, bank):
+	"""Encapsulates call to denoising model and handles padding.
+	Expects noisyframe to be normalised in [0., 1.]
+	"""
+	# Make spatial dims a multiple of 4 (two stride-2 downsamples in the UNet)
 	sh_im = noisyframe.size()
-	expanded_h = sh_im[-2]%4
+	expanded_h = sh_im[-2] % 4
 	if expanded_h:
-		expanded_h = 4-expanded_h
-	expanded_w = sh_im[-1]%4
+		expanded_h = 4 - expanded_h
+	expanded_w = sh_im[-1] % 4
 	if expanded_w:
-		expanded_w = 4-expanded_w
+		expanded_w = 4 - expanded_w
 	padexp = (0, expanded_w, 0, expanded_h)
 	noisyframe = F.pad(input=noisyframe, pad=padexp, mode='reflect')
 	sigma_noise = F.pad(input=sigma_noise, pad=padexp, mode='reflect')
 
-	# denoise
-	out = torch.clamp(model(noisyframe, sigma_noise), 0., 1.)
+	# Denoise — model updates bank internally
+	out = torch.clamp(model(noisyframe, sigma_noise, bank), 0., 1.)
 
 	if expanded_h:
 		out = out[:, :, :-expanded_h, :]
@@ -32,47 +32,31 @@ def temp_denoise(model, noisyframe, sigma_noise):
 
 	return out
 
-def denoise_seq_fastdvdnet(seq, noise_std, temp_psz, model_temporal):
-	r"""Denoises a sequence of frames with FastDVDnet.
+
+def denoise_seq_fastdvdnet(seq, noise_std, temp_psz, model_temporal, bank_size=10):
+	r"""Denoises a sequence of frames with FastDVDnet (single-frame + KV bank).
 
 	Args:
-		seq: Tensor. [numframes, 1, C, H, W] array containing the noisy input frames
-		noise_std: Tensor. Standard deviation of the added noise
-		temp_psz: size of the temporal patch
-		model_temp: instance of the PyTorch model of the temporal denoiser
+		seq           : Tensor [numframes, C, H, W] -- noisy input frames in [0, 1]
+		noise_std     : Tensor -- scalar noise std
+		temp_psz      : kept for API compatibility (unused -- bank handles temporal context)
+		model_temporal: FastDVDnet model instance
+		bank_size     : KVBank capacity (default 10)
 	Returns:
-		denframes: Tensor, [numframes, C, H, W]
+		denframes     : Tensor [numframes, C, H, W]
 	"""
-	# init arrays to handle contiguous frames and related patches
 	numframes, C, H, W = seq.shape
-	ctrlfr_idx = int((temp_psz-1)//2)
-	inframes = list()
 	denframes = torch.empty((numframes, C, H, W)).to(seq.device)
 
-	# build noise map from noise std---assuming Gaussian noise
+	# Build noise map from noise std
 	noise_map = noise_std.expand((1, 1, H, W))
 
+	# Fresh bank per sequence
+	bank = KVBank(bank_size=bank_size)
+
 	for fridx in range(numframes):
-		# load input frames
-		if not inframes:
-		# if list not yet created, fill it with temp_patchsz frames
-			for idx in range(temp_psz):
-				relidx = abs(idx-ctrlfr_idx) # handle border conditions, reflect
-				inframes.append(seq[relidx])
-		else:
-			del inframes[0]
-			relidx = min(fridx + ctrlfr_idx, -fridx + 2*(numframes-1)-ctrlfr_idx) # handle border conditions
-			inframes.append(seq[relidx])
+		frame_t = seq[fridx].unsqueeze(0)   # (1, C, H, W)
+		denframes[fridx] = temp_denoise(model_temporal, frame_t, noise_map, bank)
 
-		inframes_t = torch.stack(inframes, dim=0).contiguous().view((1, temp_psz*C, H, W)).to(seq.device)
-
-		# append result to output list
-		denframes[fridx] = temp_denoise(model_temporal, inframes_t, noise_map)
-
-	# free memory up
-	del inframes
-	del inframes_t
 	torch.cuda.empty_cache()
-
-	# convert to appropiate type and return
 	return denframes
