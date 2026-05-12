@@ -5,7 +5,7 @@ Key differences from the original:
   - Frames fed ONE AT A TIME in temporal order via an inner loop.
   - A fresh KVBank is created per mini-batch; bank.push() is called inside
     model.forward() after attention, so temporal context builds up naturally.
-  - Loss is computed only on the central frame (same as original FastDVDnet).
+  - Combined loss: Charbonnier + Frequency + Temporal consistency.
   - Noisy frames are clamped to [0, 1] before the forward pass.
   - During training, KV tensors in the bank are NOT detached so that gradients
     can flow back through the temporal attention path.
@@ -17,17 +17,111 @@ import argparse
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torchvision.utils as tutils
+import time as _time
 
 from models import FastDVDnet, KVBank
 from dataset import ValDataset
 from simple_dataloader import train_simple_loader
-from utils import svd_orthogonalization, close_logger, init_logging, normalize_augment
+from utils import svd_orthogonalization, close_logger, init_logging, normalize_augment, batch_psnr
 from train_common import (resume_training, lr_scheduler, log_train_psnr,
-                          validate_and_log, save_model_checkpoint)
+                          save_model_checkpoint)
 from fastdvdnet import denoise_seq_fastdvdnet
-import torchvision.utils as tutils
-from utils import batch_psnr
-import time as _time
+
+
+# ---------------------------------------------------------------------------
+# Loss functions
+# ---------------------------------------------------------------------------
+
+class CharbonnierLoss(nn.Module):
+    """
+    Charbonnier loss: sqrt((pred - target)^2 + eps^2)
+    A smooth L1-like loss that is more robust than MSE — less over-smoothing,
+    better edge preservation, slightly higher PSNR than MSE in practice.
+    """
+    def __init__(self, eps: float = 1e-3):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        diff = pred - target
+        return torch.mean(torch.sqrt(diff * diff + self.eps ** 2))
+
+
+class FrequencyLoss(nn.Module):
+    """
+    Frequency-domain loss: L1 on the 2D FFT magnitude spectrum.
+    Penalises errors in high-frequency components (edges, textures) that
+    pixel-space losses tend to under-weight, improving perceptual sharpness.
+    """
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        pred_fft   = torch.fft.rfft2(pred,   norm='ortho')
+        target_fft = torch.fft.rfft2(target, norm='ortho')
+        return torch.mean(torch.abs(pred_fft - target_fft))
+
+
+class TemporalConsistencyLoss(nn.Module):
+    """
+    Temporal consistency loss: L1 between consecutive denoised frames.
+    Penalises flicker — large changes between adjacent outputs that are not
+    present in the clean signal. Applied only when a previous frame exists.
+    """
+    def forward(self, out_t: torch.Tensor, out_prev: torch.Tensor) -> torch.Tensor:
+        return torch.mean(torch.abs(out_t - out_prev))
+
+
+class CombinedLoss(nn.Module):
+    """
+    Weighted sum of Charbonnier + Frequency + Temporal losses.
+
+    Default weights:
+        lambda_pixel  = 1.0   (anchor — drives PSNR)
+        lambda_freq   = 0.1   (sharpness / texture recovery)
+        lambda_temp   = 0.05  (flicker suppression)
+
+    All three are individually logged to TensorBoard so you can tune weights
+    by watching which component dominates.
+    """
+    def __init__(self,
+                 lambda_pixel: float = 1.0,
+                 lambda_freq:  float = 0.1,
+                 lambda_temp:  float = 0.05,
+                 charbonnier_eps: float = 1e-3):
+        super().__init__()
+        self.lambda_pixel = lambda_pixel
+        self.lambda_freq  = lambda_freq
+        self.lambda_temp  = lambda_temp
+
+        self.charbonnier = CharbonnierLoss(eps=charbonnier_eps)
+        self.frequency   = FrequencyLoss()
+        self.temporal    = TemporalConsistencyLoss()
+
+    def forward(self,
+                pred:     torch.Tensor,
+                target:   torch.Tensor,
+                prev_out: torch.Tensor = None):
+        """
+        Args:
+            pred    : (N, C, H, W) denoised output for the current frame
+            target  : (N, C, H, W) clean ground truth
+            prev_out: (N, C, H, W) denoised output of the previous frame,
+                      or None for the very first frame in a sequence
+        Returns:
+            total   : scalar combined loss
+            l_pixel : scalar Charbonnier component (for logging)
+            l_freq  : scalar frequency component   (for logging)
+            l_temp  : scalar temporal component    (for logging, 0 if prev_out is None)
+        """
+        l_pixel = self.charbonnier(pred, target)
+        l_freq  = self.frequency(pred, target)
+        l_temp  = self.temporal(pred, prev_out) if prev_out is not None \
+                  else torch.tensor(0.0, device=pred.device)
+
+        total = (self.lambda_pixel * l_pixel
+                 + self.lambda_freq  * l_freq
+                 + self.lambda_temp  * l_temp)
+
+        return total, l_pixel, l_freq, l_temp
 
 
 # ---------------------------------------------------------------------------
@@ -43,17 +137,14 @@ def validate_and_log_singleframe(model, dataset_val, valnoisestd, bank_size,
     model.eval()
     with torch.no_grad():
         for seq_val in dataset_val:
-            # seq_val: (numframes, C, H, W) float32 in [0, 1]
-            noise = torch.FloatTensor(seq_val.size()).normal_(mean=0, std=valnoisestd)
+            noise    = torch.FloatTensor(seq_val.size()).normal_(mean=0, std=valnoisestd)
             seqn_val = (seq_val + noise).clamp(0., 1.).cuda()
-            seq_val_gpu = seq_val.cuda()
             sigma_noise = torch.cuda.FloatTensor([valnoisestd])
 
-            # Denoise frame-by-frame with a fresh bank per clip
             out_val = denoise_seq_fastdvdnet(
                 seq=seqn_val,
                 noise_std=sigma_noise,
-                temp_psz=None,          # unused in new API
+                temp_psz=None,
                 model_temporal=model,
                 bank_size=bank_size,
             )
@@ -65,7 +156,6 @@ def validate_and_log_singleframe(model, dataset_val, valnoisestd, bank_size,
         writer.add_scalar('PSNR on validation data', psnr_val, epoch)
         writer.add_scalar('Learning rate', lr, epoch)
 
-    # Log images
     try:
         idx = 0
         if epoch == 0:
@@ -88,9 +178,8 @@ def validate_and_log_singleframe(model, dataset_val, valnoisestd, bank_size,
 def main(**args):
     """Performs the main training loop."""
 
-    # Load datasets
     print('> Loading datasets ...')
-    dataset_val = ValDataset(valsetdir=args['valset_dir'], gray_mode=False)
+    dataset_val  = ValDataset(valsetdir=args['valset_dir'], gray_mode=False)
     loader_train = train_simple_loader(
         batch_size=args['batch_size'],
         file_root=args['trainset_dir'],
@@ -118,8 +207,13 @@ def main(**args):
     print(model)
     model = nn.DataParallel(model, device_ids=[0]).cuda()
 
-    # Loss & optimiser
-    criterion = nn.MSELoss(reduction='sum')
+    # Combined loss
+    criterion = CombinedLoss(
+        lambda_pixel=args['lambda_pixel'],
+        lambda_freq=args['lambda_freq'],
+        lambda_temp=args['lambda_temp'],
+    ).cuda()
+
     optimizer = optim.Adam(model.parameters(), lr=args['lr'])
 
     start_epoch, training_params = resume_training(args, model, optimizer)
@@ -139,44 +233,44 @@ def main(**args):
             model.train()
             optimizer.zero_grad()
 
-            # data['data']: (N, temp_patch_size, C, H, W) in [0, 255]
             # normalize_augment -> img_train: (N, temp_patch_size*C, H, W) in [0,1]
             #                      gt_train:  (N, C, H, W) central frame clean
             img_train, gt_train = normalize_augment(data['data'], ctrl_fr_idx)
             N, _, H, W = img_train.size()
             num_frames = args['temp_patch_size']
 
-            # Single noise std shared across all frames in each sequence
-            stdn = torch.empty((N, 1, 1, 1)).uniform_(
-                args['noise_ival'][0], args['noise_ival'][1]
-            )
-
+            stdn      = torch.empty((N, 1, 1, 1)).uniform_(args['noise_ival'][0],
+                                                            args['noise_ival'][1])
             gt_train  = gt_train.cuda(non_blocking=True)
             noise_map = stdn.expand(N, 1, H, W).cuda(non_blocking=True)
 
-            # Fresh KV bank per mini-batch
-            # NOTE: we do NOT detach KV tensors during training so gradients
-            # can flow back through the temporal attention path.
+            # Fresh KV bank per mini-batch (detach=False for gradient flow)
             bank = KVBank(bank_size=args['bank_size'], detach=False)
 
             loss      = torch.tensor(0.0).cuda()
             out_train = None
+            out_prev  = None   # tracks previous frame output for temporal loss
 
             for t in range(num_frames):
-                ft = img_train[:, 3*t:3*t+3, :, :]    # clean frame (N,3,H,W)
+                ft      = img_train[:, 3*t:3*t+3, :, :]
+                noise_t = torch.normal(mean=torch.zeros_like(ft), std=stdn.expand_as(ft))
+                ftn     = (ft + noise_t).clamp(0., 1.).cuda(non_blocking=True)
 
-                # Add noise and clamp to valid range
-                noise_t = torch.normal(mean=torch.zeros_like(ft),
-                                       std=stdn.expand_as(ft))
-                ftn = (ft + noise_t).clamp(0., 1.).cuda(non_blocking=True)
-
-                # Forward pass — bank is updated inside model.forward()
                 out_t = model(ftn, noise_map, bank)
 
-                # Loss only on the central frame
+                # Compute combined loss on central frame
                 if t == ctrl_fr_idx:
-                    loss = criterion(gt_train, out_t) / (N * 2)
+                    loss, l_pixel, l_freq, l_temp = criterion(
+                        pred=out_t,
+                        target=gt_train,
+                        prev_out=out_prev,
+                    )
                     out_train = out_t
+
+                # Keep previous output for temporal loss (detached — we only
+                # want to penalise the current frame's output, not backprop
+                # through the previous frame's graph a second time)
+                out_prev = out_t.detach()
 
             loss.backward()
             optimizer.step()
@@ -185,6 +279,13 @@ def main(**args):
             if training_params['step'] % args['save_every'] == 0:
                 if not training_params['no_orthog']:
                     model.apply(svd_orthogonalization)
+
+                # Log individual loss components to TensorBoard
+                writer.add_scalar('loss/total',    loss.item(),    training_params['step'])
+                writer.add_scalar('loss/pixel',    l_pixel.item(), training_params['step'])
+                writer.add_scalar('loss/freq',     l_freq.item(),  training_params['step'])
+                writer.add_scalar('loss/temporal', l_temp.item(),  training_params['step'])
+
                 log_train_psnr(out_train, gt_train, loss,
                                writer, epoch, i, num_minibatches, training_params)
 
@@ -219,6 +320,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Train FastDVDnet (single-frame + KV bank)")
 
+    # Training
     parser.add_argument("--batch_size",             type=int,   default=64)
     parser.add_argument("--epochs", "--e",           type=int,   default=80)
     parser.add_argument("--resume_training", "--r",  action='store_true')
@@ -229,12 +331,26 @@ if __name__ == "__main__":
     parser.add_argument("--save_every_epochs",       type=int,   default=5)
     parser.add_argument("--noise_ival",              nargs=2, type=int, default=[5, 55])
     parser.add_argument("--val_noiseL",              type=float, default=25)
+
+    # Patch / sequence
     parser.add_argument("--patch_size", "--p",       type=int,   default=96)
     parser.add_argument("--temp_patch_size", "--tp", type=int,   default=5)
     parser.add_argument("--max_number_patches","--m",type=int,   default=256000)
+
+    # KV bank
     parser.add_argument("--bank_size",               type=int,   default=10)
     parser.add_argument("--num_heads",               type=int,   default=4)
     parser.add_argument("--pool_size",               type=int,   default=8)
+
+    # Loss weights
+    parser.add_argument("--lambda_pixel",            type=float, default=1.0,
+                        help="Weight for Charbonnier pixel loss")
+    parser.add_argument("--lambda_freq",             type=float, default=0.1,
+                        help="Weight for frequency domain loss")
+    parser.add_argument("--lambda_temp",             type=float, default=0.05,
+                        help="Weight for temporal consistency loss")
+
+    # Dirs
     parser.add_argument("--log_dir",                 type=str,   default="logs")
     parser.add_argument("--trainset_dir",            type=str,   default=None)
     parser.add_argument("--valset_dir",              type=str,   default=None)
