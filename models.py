@@ -1,16 +1,23 @@
 """
-FastDVDnet — Single-frame input with KV Bank cross-attention at bottleneck.
+FastDVDnet — YUV422 single-frame input with KV Bank cross-attention at bottleneck.
 
-Changes from the original:
-  1. Single-frame input (frame_t + noise_map) instead of 3-frame stacked input.
-  2. KV bank cross-attention at the bottleneck — current frame queries past frames'
-     compressed features stored in a rolling ring-buffer (KVBank).
-  3. All DSConv (depthwise 3x3 + pointwise 1x1) replaced with standard Conv2d(3x3).
-  4. PixelShuffle replaced with ConvTranspose2d(kernel=2, stride=2).
+YUV422 architecture:
+  - Input: Y channel (N, 1, H, W) + noise map (N, 1, H, W)  → 2 channels at full res
+  - After first DownBlock (H/2, W/2): U and V channels (N, 2, H/2, W/2) are
+    concatenated with the feature map — exactly matching their native YUV422 resolution
+  - Decoder outputs Y channel (N, 1, H, W) only — U/V passed through with bilinear upsample
+  - Final output: reconstructed RGB (N, 3, H, W) via YUV→RGB conversion
+
+Benefits:
+  - InputCvBlock and downc0 operate on 2ch instead of 4ch → ~2x cheaper at full resolution
+  - U/V injected at H/2 where they naturally live in YUV422 — no artificial upsampling
+  - KV bank at bottleneck sees Y+UV enriched features — same concept, richer representation
+  - PSNR measured on RGB after YUV→RGB reconstruction for fair comparison
 """
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 # ---------------------------------------------------------------------------
@@ -27,7 +34,7 @@ class CvBlock(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True)
+            nn.ReLU(inplace=True),
         )
 
     def forward(self, x):
@@ -35,33 +42,80 @@ class CvBlock(nn.Module):
 
 
 class InputCvBlock(nn.Module):
-    """(Conv2d 3x3 => BN => ReLU) x 2 — accepts single frame + noise map (4 channels)."""
+    """
+    First encoder block for YUV422 input.
+    Accepts Y channel + noise map only: (N, 2, H, W)
+    U/V are injected later at H/2 in DownBlock0.
+    """
     def __init__(self, out_ch):
         super(InputCvBlock, self).__init__()
         self.interm_ch = 30
-        # 3 (RGB) + 1 (noise map) = 4 input channels
+        # Y (1) + noise map (1) = 2 input channels
         self.convblock = nn.Sequential(
-            nn.Conv2d(4, self.interm_ch, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(2, self.interm_ch, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(self.interm_ch),
             nn.ReLU(inplace=True),
             nn.Conv2d(self.interm_ch, out_ch, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True)
+            nn.ReLU(inplace=True),
         )
 
     def forward(self, x):
         return self.convblock(x)
 
 
+class DownBlockWithUV(nn.Module):
+    """
+    First downsampling block — injects U and V after stride-2 conv.
+
+    Flow:
+      x (N, in_ch, H, W)
+        → stride-2 conv → (N, out_ch, H/2, W/2)
+        → concat U, V   → (N, out_ch+2, H/2, W/2)
+        → fusion conv   → (N, out_ch, H/2, W/2)
+        → CvBlock       → (N, out_ch, H/2, W/2)
+
+    U and V arrive at (N, 1, H/2, W/2) each — their native YUV422 resolution.
+    No upsampling needed; they slot in exactly at the right spatial scale.
+    """
+    def __init__(self, in_ch, out_ch):
+        super(DownBlockWithUV, self).__init__()
+        self.down = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+        # Fusion: merges downsampled features with U and V (2 extra channels)
+        self.fusion = nn.Sequential(
+            nn.Conv2d(out_ch + 2, out_ch, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+        self.cvblock = CvBlock(out_ch, out_ch)
+
+    def forward(self, x, uv):
+        """
+        Args:
+            x  : (N, in_ch, H, W)     — Y feature map at full res
+            uv : (N, 2, H/2, W/2)     — U and V channels at half res
+        Returns:
+            out: (N, out_ch, H/2, W/2)
+        """
+        x = self.down(x)              # (N, out_ch, H/2, W/2)
+        x = torch.cat([x, uv], dim=1) # (N, out_ch+2, H/2, W/2)
+        x = self.fusion(x)            # (N, out_ch, H/2, W/2)
+        return self.cvblock(x)
+
+
 class DownBlock(nn.Module):
-    """Stride-2 Conv2d => BN => ReLU => CvBlock"""
+    """Standard downsampling block (used after UV injection)."""
     def __init__(self, in_ch, out_ch):
         super(DownBlock, self).__init__()
         self.convblock = nn.Sequential(
             nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=2, padding=1, bias=False),
             nn.BatchNorm2d(out_ch),
             nn.ReLU(inplace=True),
-            CvBlock(out_ch, out_ch)
+            CvBlock(out_ch, out_ch),
         )
 
     def forward(self, x):
@@ -80,14 +134,17 @@ class UpBlock(nn.Module):
 
 
 class OutputCvBlock(nn.Module):
-    """Conv2d 3x3 => BN => ReLU => Conv2d 3x3"""
-    def __init__(self, in_ch, out_ch):
+    """
+    Final decoder block.
+    Outputs Y channel only (N, 1, H, W) — U/V are handled separately.
+    """
+    def __init__(self, in_ch):
         super(OutputCvBlock, self).__init__()
         self.convblock = nn.Sequential(
             nn.Conv2d(in_ch, in_ch, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(in_ch),
             nn.ReLU(inplace=True),
-            nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, bias=False)
+            nn.Conv2d(in_ch, 1, kernel_size=3, padding=1, bias=False),  # Y only
         )
 
     def forward(self, x):
@@ -100,31 +157,26 @@ class OutputCvBlock(nn.Module):
 
 class KVBank:
     """
-    Rolling buffer that stores (key, value) tensors from past bottleneck frames.
+    Rolling buffer storing (key, value) tensors from past bottleneck frames.
 
-    Usage:
-        bank = KVBank(bank_size=10)
-        bank.reset()                 # call at sequence start or scene cut
-        bank.push(k, v)              # store current frame's KV after forward pass
-        keys, vals = bank.get()      # returns concatenated past KVs, or (None, None)
+    Each entry: (N, S, C) where S = pool_size^2.
+    bank.get() returns (N, T*S, C) across T stored frames.
 
-    Tensors stay on whatever device they were computed on — no explicit .to() needed.
+    detach=True  -> inference (no grad, saves memory)
+    detach=False -> training  (gradients flow through temporal attention)
     """
 
     def __init__(self, bank_size: int = 10, detach: bool = True):
         self.bank_size = bank_size
-        # detach=True  -> inference/validation (no grad needed, saves memory)
-        # detach=False -> training (gradients flow through temporal attention)
-        self.detach = detach
-        self._keys:   list = []   # each entry: (N, S, C)
-        self._values: list = []   # each entry: (N, S, C)
+        self.detach    = detach
+        self._keys:   list = []
+        self._values: list = []
 
     def reset(self):
         self._keys.clear()
         self._values.clear()
 
     def push(self, k: torch.Tensor, v: torch.Tensor):
-        """Store current frame's projected key and value tokens."""
         self._keys.append(k.detach() if self.detach else k)
         self._values.append(v.detach() if self.detach else v)
         if len(self._keys) > self.bank_size:
@@ -132,7 +184,6 @@ class KVBank:
             self._values.pop(0)
 
     def get(self):
-        """Returns (keys, values) shaped (N, T*S, C), or (None, None) if empty."""
         if not self._keys:
             return None, None
         return torch.cat(self._keys, dim=1), torch.cat(self._values, dim=1)
@@ -147,18 +198,16 @@ class KVBank:
 
 class BottleneckCrossAttn(nn.Module):
     """
-    Cross-attention at the bottleneck:
-      Q  <- current frame's bottleneck features (spatially pooled to pool_size x pool_size)
-      KV <- concatenated past frames from KVBank
+    Cross-attention at the bottleneck (unchanged from original design):
+      Q  <- current frame bottleneck tokens (AdaptiveAvgPool -> flatten)
+      KV <- past T frames from KVBank
 
-    When the bank is empty (first frame of a sequence), passes features through unchanged.
+    First frame falls through unchanged (empty bank).
 
     Args:
-        ch        : bottleneck channel count (128 by default)
-        num_heads : number of attention heads
-        pool_size : spatial size after AdaptiveAvgPool2d before attention.
-                    e.g. pool_size=8 gives 64 tokens regardless of input resolution,
-                    keeping attention cost O(1) w.r.t. spatial resolution.
+        ch        : bottleneck channels (128)
+        num_heads : attention heads
+        pool_size : output size of AdaptiveAvgPool2d (pool_size x pool_size tokens)
     """
     def __init__(self, ch: int = 128, num_heads: int = 4, pool_size: int = 8):
         super(BottleneckCrossAttn, self).__init__()
@@ -170,35 +219,22 @@ class BottleneckCrossAttn(nn.Module):
         self.gate = nn.Sequential(nn.Linear(ch, ch), nn.Sigmoid())
 
     def _to_tokens(self, feat):
-        """(N, C, H, W) -> (N, S, C)  where S = pool_size^2"""
+        """(N, C, H, W) -> (N, S, C)"""
         return self.pool(feat).flatten(2).transpose(1, 2)
 
     def forward(self, x: torch.Tensor, bank: KVBank):
-        """
-        Args:
-            x    : bottleneck feature map (N, C, H, W)
-            bank : KVBank (may be empty on the first frame)
-        Returns:
-            x_out  : (N, C, H, W) — temporally enriched bottleneck features
-            k_cur  : (N, S, C)    — current frame's key   (caller pushes to bank)
-            v_cur  : (N, S, C)    — current frame's value (caller pushes to bank)
-        """
         N, C, H, W = x.shape
 
-        tokens = self._to_tokens(x)       # (N, S, C)
+        tokens = self._to_tokens(x)
         q_cur  = self.to_q(tokens)
         k_cur  = self.to_k(tokens)
         v_cur  = self.to_v(tokens)
 
         bank_k, bank_v = bank.get()
         if bank_k is None:
-            # First frame — no past context, pass through unchanged
             return x, k_cur, v_cur
 
-        # Cross-attention: Q=current, KV=past frames
-        attn_out, _ = self.attn(q_cur, bank_k, bank_v)   # (N, S, C)
-
-        # Channel-wise gate applied to full-res feature map (residual add)
+        attn_out, _ = self.attn(q_cur, bank_k, bank_v)
         gate  = self.gate(attn_out.mean(dim=1)).view(N, C, 1, 1)
         x_out = x * gate + x
 
@@ -206,11 +242,36 @@ class BottleneckCrossAttn(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Denoising block
+# Denoising block — YUV422 input
 # ---------------------------------------------------------------------------
 
 class DenBlock(nn.Module):
-    """Definition of the denoising block of FastDVDnet (single-frame + KV bank)."""
+    """
+    FastDVDnet denoising block with YUV422 input.
+
+    Input flow:
+      Y  : (N, 1, H, W)   — full resolution luma
+      UV : (N, 2, H/2, W/2) — half-res chroma (YUV422 native)
+      noise_map: (N, 1, H, W)
+
+    Encoder:
+      L0: InputCvBlock(Y + noise_map)          → (N, 32, H, W)
+      L1: DownBlockWithUV(x0, UV)              → (N, 64, H/2, W/2)  ← UV injected here
+      L2: DownBlock(x1)                        → (N, 128, H/4, W/4) ← bottleneck
+
+    KV bank cross-attention at L2 (bottleneck).
+
+    Decoder:
+      upc2: UpBlock(x2)        + skip x1 → (N, 64, H/2, W/2)
+      upc1: UpBlock(x1+x2)     + skip x0 → (N, 32, H, W)
+      outc: OutputCvBlock(x0+x1)         → (N, 1, H, W)  ← Y residual
+
+    Output:
+      denoised_Y = Y - predicted_residual   (N, 1, H, W)
+      denoised_UV = UV (passed through, optionally light denoising)
+      → convert back to RGB in forward()
+    """
+
     def __init__(self, bank_size: int = 10, num_heads: int = 4, pool_size: int = 8):
         super(DenBlock, self).__init__()
         self.chs_lyr0 = 32
@@ -218,19 +279,21 @@ class DenBlock(nn.Module):
         self.chs_lyr2 = 128
 
         # Encoder
-        self.inc    = InputCvBlock(out_ch=self.chs_lyr0)
-        self.downc0 = DownBlock(in_ch=self.chs_lyr0, out_ch=self.chs_lyr1)
-        self.downc1 = DownBlock(in_ch=self.chs_lyr1, out_ch=self.chs_lyr2)
+        self.inc    = InputCvBlock(out_ch=self.chs_lyr0)           # Y + noise_map
+        self.downc0 = DownBlockWithUV(self.chs_lyr0, self.chs_lyr1)  # injects UV at H/2
+        self.downc1 = DownBlock(self.chs_lyr1, self.chs_lyr2)     # bottleneck
 
         # Bottleneck KV-bank cross-attention
-        self.kv_attn = BottleneckCrossAttn(ch=self.chs_lyr2,
-                                           num_heads=num_heads,
-                                           pool_size=pool_size)
+        self.kv_attn = BottleneckCrossAttn(
+            ch=self.chs_lyr2,
+            num_heads=num_heads,
+            pool_size=pool_size,
+        )
 
         # Decoder
         self.upc2 = UpBlock(in_ch=self.chs_lyr2, out_ch=self.chs_lyr1)
         self.upc1 = UpBlock(in_ch=self.chs_lyr1, out_ch=self.chs_lyr0)
-        self.outc = OutputCvBlock(in_ch=self.chs_lyr0, out_ch=3)
+        self.outc = OutputCvBlock(in_ch=self.chs_lyr0)  # outputs 1ch Y
 
         self.reset_params()
 
@@ -243,33 +306,38 @@ class DenBlock(nn.Module):
         for _, m in enumerate(self.modules()):
             self.weight_init(m)
 
-    def forward(self, frame_t: torch.Tensor, noise_map: torch.Tensor, bank: KVBank):
+    def forward(self, y: torch.Tensor, uv: torch.Tensor,
+                noise_map: torch.Tensor, bank: KVBank):
         """
         Args:
-            frame_t   : (N, 3, H, W)  noisy current frame in [0, 1]
-            noise_map : (N, 1, H, W)  per-image noise std map
-            bank      : KVBank        rolling buffer of past K/V tensors
+            y         : (N, 1, H, W)     — noisy Y channel in [0, 1]
+            uv        : (N, 2, H/2, W/2) — noisy U, V channels in [0, 1]
+            noise_map : (N, 1, H, W)     — noise std map for Y
+            bank      : KVBank
+
         Returns:
-            denoised  : (N, 3, H, W)
+            denoised_y  : (N, 1, H, W)
+            denoised_uv : (N, 2, H/2, W/2)  — UV passed through (model focuses on Y)
         """
         # Encoder
-        x0 = self.inc(torch.cat((frame_t, noise_map), dim=1))  # (N, 32, H,   W  )
-        x1 = self.downc0(x0)                                   # (N, 64, H/2, W/2)
-        x2 = self.downc1(x1)                                   # (N,128, H/4, W/4)
+        x0 = self.inc(torch.cat([y, noise_map], dim=1))  # (N, 32, H,   W  )
+        x1 = self.downc0(x0, uv)                         # (N, 64, H/2, W/2)
+        x2 = self.downc1(x1)                             # (N,128, H/4, W/4)
 
-        # Bottleneck cross-attention
+        # Bottleneck KV attention
         x2, k_cur, v_cur = self.kv_attn(x2, bank)
-
-        # Push current frame's KV into bank (available to next frame)
         bank.push(k_cur, v_cur)
 
-        # Decoder — plain residual skip connections (same as original)
+        # Decoder
         x2 = self.upc2(x2)          # (N, 64, H/2, W/2)
         x1 = self.upc1(x1 + x2)    # (N, 32, H,   W  )
-        x  = self.outc(x0 + x1)    # (N,  3, H,   W  )
+        x  = self.outc(x0 + x1)    # (N,  1, H,   W  ) — Y residual
 
-        # Residual denoising: predict noise residual, subtract from input
-        return frame_t - x
+        denoised_y  = (y - x).clamp(0., 1.)
+        # UV: pass through (chroma noise is much lower energy, no separate denoiser needed)
+        denoised_uv = uv.clamp(0., 1.)
+
+        return denoised_y, denoised_uv
 
 
 # ---------------------------------------------------------------------------
@@ -278,11 +346,13 @@ class DenBlock(nn.Module):
 
 class FastDVDnet(nn.Module):
     """
-    FastDVDnet with single-frame input and temporal KV bank.
+    FastDVDnet with YUV422 single-frame input and temporal KV bank.
 
-    The model is stateless — KVBank is passed in at each forward call so the
-    training loop fully controls temporal state (resets at sequence boundaries).
+    forward() accepts Y and UV separately, returns denoised Y and UV.
+    RGB conversion is handled outside the model (in fastdvdnet.py / training loop)
+    so the model stays format-agnostic.
     """
+
     def __init__(self, bank_size: int = 10, num_heads: int = 4, pool_size: int = 8):
         super(FastDVDnet, self).__init__()
         self.num_input_frames = 1
@@ -298,16 +368,76 @@ class FastDVDnet(nn.Module):
         for _, m in enumerate(self.modules()):
             self.weight_init(m)
 
-    def forward(self, frame_t: torch.Tensor, noise_map: torch.Tensor, bank: KVBank):
+    def forward(self, y: torch.Tensor, uv: torch.Tensor,
+                noise_map: torch.Tensor, bank: KVBank):
         """
         Args:
-            frame_t   : (N, 3, H, W)
+            y         : (N, 1, H, W)
+            uv        : (N, 2, H/2, W/2)
             noise_map : (N, 1, H, W)
-            bank      : KVBank (shared across all frames in a sequence)
+            bank      : KVBank
         Returns:
-            denoised  : (N, 3, H, W)
+            denoised_y  : (N, 1, H, W)
+            denoised_uv : (N, 2, H/2, W/2)
         """
-        return self.temp(frame_t, noise_map, bank)
+        return self.temp(y, uv, noise_map, bank)
+
+
+# ---------------------------------------------------------------------------
+# YUV <-> RGB utilities
+# ---------------------------------------------------------------------------
+
+def rgb_to_yuv422(rgb: torch.Tensor):
+    """
+    Converts an RGB tensor to YUV422.
+
+    Args:
+        rgb : (N, 3, H, W) float32 in [0, 1]  — R, G, B channels
+
+    Returns:
+        y   : (N, 1, H, W)     float32 in [0, 1]
+        uv  : (N, 2, H/2, W/2) float32 in [0, 1]  — U then V, downsampled 2x
+    """
+    r, g, b = rgb[:, 0:1], rgb[:, 1:2], rgb[:, 2:3]
+
+    # BT.601 coefficients (standard for video)
+    y =  0.299 * r + 0.587 * g + 0.114 * b               # (N, 1, H, W)
+    u = -0.169 * r - 0.331 * g + 0.500 * b + 0.5         # (N, 1, H, W) shifted to [0,1]
+    v =  0.500 * r - 0.419 * g - 0.081 * b + 0.5         # (N, 1, H, W) shifted to [0,1]
+
+    # Downsample U, V by 2x (YUV422: full H, half W; here we do H/2 W/2 for simplicity)
+    u_ds = F.avg_pool2d(u, kernel_size=2, stride=2)       # (N, 1, H/2, W/2)
+    v_ds = F.avg_pool2d(v, kernel_size=2, stride=2)       # (N, 1, H/2, W/2)
+
+    uv = torch.cat([u_ds, v_ds], dim=1)                   # (N, 2, H/2, W/2)
+    return y, uv
+
+
+def yuv422_to_rgb(y: torch.Tensor, uv: torch.Tensor):
+    """
+    Converts YUV422 back to RGB.
+
+    Args:
+        y   : (N, 1, H, W)     float32 in [0, 1]
+        uv  : (N, 2, H/2, W/2) float32 in [0, 1]
+
+    Returns:
+        rgb : (N, 3, H, W) float32 in [0, 1]
+    """
+    # Upsample U, V back to full resolution
+    u = F.interpolate(uv[:, 0:1], scale_factor=2, mode='bilinear', align_corners=False)
+    v = F.interpolate(uv[:, 1:2], scale_factor=2, mode='bilinear', align_corners=False)
+
+    # Undo the [0,1] shift
+    u = u - 0.5
+    v = v - 0.5
+
+    # BT.601 inverse
+    r = y + 1.402  * v
+    g = y - 0.344  * u - 0.714 * v
+    b = y + 1.772  * u
+
+    return torch.cat([r, g, b], dim=1).clamp(0., 1.)
 
 
 # ---------------------------------------------------------------------------
@@ -315,30 +445,21 @@ class FastDVDnet(nn.Module):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    import numpy as np
     from torchinfo import summary
 
     bank_size = 10
     model = FastDVDnet(bank_size=bank_size, num_heads=4, pool_size=8)
     print(model)
 
-    # Simulate a short sequence of 5 frames
     bank = KVBank(bank_size=bank_size)
     model.eval()
     with torch.no_grad():
         for t in range(5):
-            frame     = torch.randn(1, 3, 96, 96)
-            noise_map = torch.randn(1, 1, 96, 96)
-            out = model(frame, noise_map, bank)
-            print(f"t={t}  bank_len={len(bank)}  out={out.shape}")
+            rgb       = torch.rand(1, 3, 96, 96)
+            y, uv     = rgb_to_yuv422(rgb)
+            noise_map = torch.zeros(1, 1, 96, 96)
+            den_y, den_uv = model(y, uv, noise_map, bank)
+            den_rgb = yuv422_to_rgb(den_y, den_uv)
+            print(f"t={t}  bank={len(bank)}  y={den_y.shape}  uv={den_uv.shape}  rgb={den_rgb.shape}")
 
-    summary(
-        model,
-        input_data=(
-            torch.randn(1, 3, 96, 96),
-            torch.randn(1, 1, 96, 96),
-            KVBank(bank_size=bank_size),
-        ),
-        col_names=["input_size", "output_size", "num_params"],
-        depth=5,
-    )
+    print("\nSanity check passed!")

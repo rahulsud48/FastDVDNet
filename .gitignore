@@ -52,3 +52,4 @@ logs_cross_attention_skip/events.out.tfevents.1777891921.25a0fd478946
 logs_kv_bank/
 train_logs.txt
 results_kvbank/
+logs_kv_bank_yuv/
