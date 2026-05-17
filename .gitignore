@@ -53,3 +53,7 @@ logs_kv_bank/
 train_logs.txt
 results_kvbank/
 logs_kv_bank_yuv/
+results_kvbank_residual_loss/
+train_log.txt
+logs_kv_bank_residual_loss/
+model_train_logs.txt

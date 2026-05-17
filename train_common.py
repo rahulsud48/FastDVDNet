@@ -85,6 +85,11 @@ def log_train_psnr(result, imsource, loss, writer, epoch, idx, num_minibatches, 
 def save_model_checkpoint(model, argdict, optimizer, train_pars, epoch):
 	"""Stores the model parameters under 'argdict['log_dir'] + '/net.pth'
 	Also saves a checkpoint under 'argdict['log_dir'] + '/ckpt.pth'
+
+	net.pth      — latest model weights (overwritten every epoch)
+	net_best.pth — best val PSNR weights (saved by train_fastdvdnet.py)
+	ckpt.pth     — full checkpoint for resuming (includes best_psnr tracker)
+	ckpt_e{N}.pth — periodic snapshot every save_every_epochs
 	"""
 	torch.save(model.state_dict(), os.path.join(argdict['log_dir'], 'net.pth'))
 	save_dict = { \
