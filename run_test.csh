@@ -1,7 +1,7 @@
 python test_fastdvdnet.py \
   --model_file logs_kv_bank_residual_loss/net_best.pth \
   --test_path ./data/val \
-  --save_path ./results_kvbank_residual_loss \
-  --noise_sigma 25 \
+  --save_path ./results_kvbank_residual_loss_10 \
+  --noise_sigma 40 \
   --seed 42 \
   --max_num_fr_per_seq 100

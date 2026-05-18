@@ -57,3 +57,5 @@ results_kvbank_residual_loss/
 train_log.txt
 logs_kv_bank_residual_loss/
 model_train_logs.txt
+results_kvbank_residual_loss_10/
+logs_kv_bank_noise_model/
