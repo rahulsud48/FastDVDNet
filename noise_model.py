@@ -262,16 +262,24 @@ def apply_object_motion(frame: torch.Tensor,
         bh, bw = blurred.shape[2], blurred.shape[3]
         rh2, rw2 = min(rh, bh), min(rw, bw)
 
-        # Smooth blend mask — use a simple Gaussian-like centre weight
-        # to avoid hard rectangular boundaries
-        mask_ks = min(rh2, rw2, 9)
-        if mask_ks % 2 == 0:
-            mask_ks += 1
-        mask = torch.ones(1, 1, rh2, rw2, device=device)
-        mask = F.avg_pool2d(mask, kernel_size=mask_ks, stride=1,
-                            padding=mask_ks // 2)
-        # avg_pool2d with same padding keeps size — but clamp to be safe
-        mask = mask[:, :, :rh2, :rw2].expand(N, C, rh2, rw2)
+        # Smooth blend mask — use a proper feathered gradient mask
+        # that fades from 1 in the centre to 0 at the edges
+        # This completely eliminates visible bounding box artefacts
+        margin = max(8, min(rh2 // 6, rw2 // 6, 24))  # feather width in pixels
+
+        # Build 1D fade ramps for H and W
+        ramp_h = torch.ones(rh2, device=device)
+        ramp_w = torch.ones(rw2, device=device)
+        for m in range(margin):
+            alpha = m / margin                  # 0 at edge -> 1 at margin
+            ramp_h[m]        = alpha
+            ramp_h[rh2-1-m]  = alpha
+            ramp_w[m]        = alpha
+            ramp_w[rw2-1-m]  = alpha
+
+        # 2D mask = outer product of H and W ramps
+        mask2d = ramp_h.unsqueeze(1) * ramp_w.unsqueeze(0)  # (rh2, rw2)
+        mask   = mask2d.view(1, 1, rh2, rw2).expand(N, C, rh2, rw2)
 
         result[:, :, top:top+rh2, left:left+rw2] = (
             mask * blurred[:, :, :rh2, :rw2]

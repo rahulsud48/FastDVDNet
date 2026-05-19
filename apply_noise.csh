@@ -1,7 +1,13 @@
 python apply_noise.py \
   --input data/val \
   --output data/val_noisy \
-  --noise shot read \
-  --shot_scale 1.0 \
+  --noise flicker shake read object_motion \
+  --flicker_amp 0.08 \
+  --flicker_freq 10 \
+  --shot_scale 3.5 \
   --read_sigma 0.04 \
+  --shake_kernel 9 \
+  --shake_angle 30 \
+  --obj_kernel 7 \
+  --obj_regions 3 \
   --make_video --fps 5
