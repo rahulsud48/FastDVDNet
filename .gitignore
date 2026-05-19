@@ -59,3 +59,5 @@ logs_kv_bank_residual_loss/
 model_train_logs.txt
 results_kvbank_residual_loss_10/
 logs_kv_bank_noise_model/
+blackswan_sigma25_results_kvbank_residual_loss_10.mp4
+camel_sigma25_results_kvbank_residual_loss_10.mp4
