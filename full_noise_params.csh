@@ -1,0 +1,19 @@
+python apply_noise.py \
+  --input data/val \
+  --output data/val_noisy \
+  --noise flicker shake \
+  --make_video --fps 5 \
+  --shake_kernel 7 \
+  --shake_angle 45 \
+  --obj_kernel 5 \
+  --obj_regions 2 \
+  --rolling_shift 3 \
+  --flicker_amp 0.020 \
+  --flicker_freq 50 \
+  --temporal_alpha 0.50 \
+  --drift_gain 1.010 \
+  --drift_offset 0.002 \
+  --shot_scale 0.5 \
+  --read_sigma 0.020 \
+  --fpn_strength 0.010 \
+  --prnu_strength 0.005
