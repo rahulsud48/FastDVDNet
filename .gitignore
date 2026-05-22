@@ -61,3 +61,8 @@ results_kvbank_residual_loss_10/
 logs_kv_bank_noise_model/
 blackswan_sigma25_results_kvbank_residual_loss_10.mp4
 camel_sigma25_results_kvbank_residual_loss_10.mp4
+configs/
+results_kvbank_flicker_shot_read/
+logs_kv_bank_shot_read_flicker/
+results_low_light/
+videos/
