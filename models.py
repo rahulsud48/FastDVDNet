@@ -2,7 +2,7 @@
 FastDVDnet — Y-channel 3-frame input (t-1, t, t+1), no UV in the network.
 
 Architecture:
-  Input : 3 noisy Y frames + noise map → (N, 4, H, W)
+  Input : 3 noisy Y frames + noise map → (N, 6, H, W)  [y0,nm, y1,nm, y2,nm]
   Encoder:
     L0: InputCvBlock  → (N, 32,  H,   W  )
     L1: DownBlock     → (N, 64,  H/2, W/2)
@@ -12,16 +12,16 @@ Architecture:
     upc1: UpBlock(L1+L2)     + skip L0 → (N, 32,  H,   W  )
     outc: OutputCvBlock(L0+L1)         → (N, 1,   H,   W  )  ← Y residual
 
-  y_pred = y_noisy_t - residual
+  y_pred = y_noisy_t - residual  (unclamped, clamp happens outside after loss)
 
 UV stays clean throughout and is never touched by the model.
 Loss is computed in Y domain: L(y_pred, y_clean_t).
-RGB reconstruction (for PSNR logging only) uses clean UV passed in from the caller.
+RGB reconstruction (for PSNR logging only) uses YUV444 — full spatial resolution,
+no chroma subsampling, lossless roundtrip.
 """
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 # ---------------------------------------------------------------------------
@@ -168,13 +168,7 @@ class DenBlock(nn.Module):
         Returns:
             y_pred : (N, 1, H, W)  — denoised central Y frame
         """
-        # Interleave noise map with each Y frame: [y0,nm, y1,nm, y2,nm] → (N,6,H,W)
-        inp = torch.cat([
-            y_frames[:, i:i+1, :, :] for i in range(self.num_input_frames)
-            for _ in (0,)   # trick to keep loop flat
-        ] + [noise_map] * self.num_input_frames, dim=1)
-
-        # Proper interleaving: (y0, nm, y1, nm, y2, nm)
+        # Interleave noise map with each Y frame: (y0, nm, y1, nm, y2, nm) → (N,6,H,W)
         chunks = []
         for i in range(self.num_input_frames):
             chunks.append(y_frames[:, i:i+1, :, :])
@@ -192,7 +186,7 @@ class DenBlock(nn.Module):
         residual = self.outc(x0 + x1)  # (N, 1, H, W)
 
         y_center = y_frames[:, 1:2, :, :]          # central frame (t)
-        y_pred   = (y_center - residual).clamp(0., 1.)
+        y_pred   = (y_center - residual)#.clamp(0., 1.)
         return y_pred
 
 
@@ -236,45 +230,47 @@ class FastDVDnet(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# YUV <-> RGB utilities  (unchanged — used outside the model for PSNR logging)
+# YUV444 <-> RGB utilities
+# Used outside the model for PSNR logging and image saving only.
+# YUV444 keeps full spatial resolution for U and V — no chroma subsampling,
+# lossless roundtrip (no avg_pool / interpolate), so RGB PSNR is meaningful.
+# BT.601 coefficients.
 # ---------------------------------------------------------------------------
 
-def rgb_to_yuv422(rgb: torch.Tensor):
+def rgb_to_yuv444(rgb: torch.Tensor):
     """
-    Converts an RGB tensor to YUV422.
+    Converts an RGB tensor to YUV444 (full resolution, no subsampling).
 
     Args:
         rgb : (N, 3, H, W) float32 in [0, 1]
 
     Returns:
-        y   : (N, 1, H, W)
-        uv  : (N, 2, H/2, W/2)   — U then V, spatially downsampled 2x
+        y  : (N, 1, H, W)   luma
+        uv : (N, 2, H, W)   chroma U and V at full resolution
     """
     r, g, b = rgb[:, 0:1], rgb[:, 1:2], rgb[:, 2:3]
 
-    y =  0.299 * r + 0.587 * g + 0.114 * b
-    u = -0.169 * r - 0.331 * g + 0.500 * b + 0.5
-    v =  0.500 * r - 0.419 * g - 0.081 * b + 0.5
+    y =  0.299  * r + 0.587  * g + 0.114  * b
+    u = -0.169  * r - 0.331  * g + 0.500  * b + 0.5
+    v =  0.500  * r - 0.419  * g - 0.081  * b + 0.5
 
-    u_ds = F.avg_pool2d(u, kernel_size=2, stride=2)
-    v_ds = F.avg_pool2d(v, kernel_size=2, stride=2)
-    uv   = torch.cat([u_ds, v_ds], dim=1)
+    uv = torch.cat([u, v], dim=1)   # (N, 2, H, W) — full resolution, no pooling
     return y, uv
 
 
-def yuv422_to_rgb(y: torch.Tensor, uv: torch.Tensor):
+def yuv444_to_rgb(y: torch.Tensor, uv: torch.Tensor):
     """
-    Converts YUV422 back to RGB.
+    Converts YUV444 back to RGB.
 
     Args:
-        y   : (N, 1, H, W)
-        uv  : (N, 2, H/2, W/2)
+        y  : (N, 1, H, W)
+        uv : (N, 2, H, W)   chroma at full resolution
 
     Returns:
         rgb : (N, 3, H, W) float32 in [0, 1]
     """
-    u = F.interpolate(uv[:, 0:1], scale_factor=2, mode='bilinear', align_corners=False) - 0.5
-    v = F.interpolate(uv[:, 1:2], scale_factor=2, mode='bilinear', align_corners=False) - 0.5
+    u = uv[:, 0:1] - 0.5   # undo the +0.5 offset applied in rgb_to_yuv444
+    v = uv[:, 1:2] - 0.5
 
     r = y + 1.402  * v
     g = y - 0.344  * u - 0.714 * v
@@ -295,20 +291,18 @@ if __name__ == "__main__":
 
     model.eval()
     with torch.no_grad():
-        # Simulate a 5-frame sequence, process with sliding window t-1,t,t+1
         seq_rgb   = torch.rand(5, 3, 96, 96)
         noise_std = 25. / 255.
 
-        for t in range(1, 4):   # t=1,2,3 (valid window)
-            rgb_t       = seq_rgb[t-1:t+2]                 # (3, 3, 96, 96)
-            y_t, uv_t   = zip(*[rgb_to_yuv422(rgb_t[i:i+1]) for i in range(3)])
-            y_frames    = torch.cat(y_t, dim=1)            # (1, 3, 96, 96)  [t-1, t, t+1]
-            noise_map   = torch.full((1, 1, 96, 96), noise_std)
-            y_pred      = model(y_frames, noise_map)       # (1, 1, 96, 96)
+        for t in range(1, 4):
+            rgb_t     = seq_rgb[t-1:t+2]
+            y_t, uv_t = zip(*[rgb_to_yuv444(rgb_t[i:i+1]) for i in range(3)])
+            y_frames  = torch.cat(y_t, dim=1)            # (1, 3, 96, 96)
+            noise_map = torch.full((1, 1, 96, 96), noise_std)
+            y_pred    = model(y_frames, noise_map)        # (1, 1, 96, 96)
 
-            # RGB reconstruction for logging (clean UV from central frame)
-            uv_clean    = uv_t[1]                          # central frame UV
-            rgb_pred    = yuv422_to_rgb(y_pred, uv_clean)
+            uv_clean  = uv_t[1]                          # central frame UV (N,2,H,W)
+            rgb_pred  = yuv444_to_rgb(y_pred.clamp(0., 1.), uv_clean)
             print(f"t={t}  y_pred={y_pred.shape}  rgb_pred={rgb_pred.shape}")
 
     print("\nSanity check passed!")

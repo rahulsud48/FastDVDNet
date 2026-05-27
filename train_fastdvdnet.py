@@ -9,9 +9,10 @@ Training flow per mini-batch:
        - Add Gaussian noise to each Y -> noisy Y
        - Stack noisy Y: y_frames (N, 3, H, W)
   4. Forward: model(y_frames, noise_map) -> y_pred  (N, 1, H, W)
-  5. Loss: computed on y_pred vs y_clean (central frame Y only)
+  5. Loss: MSELoss(reduction='sum') / (N*2) on y_pred vs y_clean
+     (matches original FastDVDnet — github.com/m-tassano/fastdvdnet)
 
-PSNR for validation is computed in RGB space (yuv422_to_rgb with clean UV)
+PSNR for validation is computed in RGB space (yuv444_to_rgb with clean UV (YUV444 — full resolution, lossless roundtrip))
 so it stays comparable to RGB baselines.
 """
 
@@ -24,7 +25,7 @@ import torch.optim as optim
 import torchvision.utils as tutils
 import time as _time
 
-from models import FastDVDnet, rgb_to_yuv422, yuv422_to_rgb
+from models import FastDVDnet, rgb_to_yuv444, yuv444_to_rgb
 from dataset import ValDataset
 from simple_dataloader import train_simple_loader
 from utils import svd_orthogonalization, close_logger, init_logging, normalize_augment, batch_psnr
@@ -34,45 +35,12 @@ from fastdvdnet import denoise_seq_fastdvdnet
 
 
 # ---------------------------------------------------------------------------
-# Loss functions
+# Loss
 # ---------------------------------------------------------------------------
-
-class CharbonnierLoss(nn.Module):
-    def __init__(self, eps: float = 1e-3):
-        super().__init__()
-        self.eps = eps
-
-    def forward(self, pred, target):
-        diff = pred - target
-        return torch.mean(torch.sqrt(diff * diff + self.eps ** 2))
-
-
-class FrequencyLoss(nn.Module):
-    def forward(self, pred, target):
-        pred_fft   = torch.fft.rfft2(pred,   norm='ortho')
-        target_fft = torch.fft.rfft2(target, norm='ortho')
-        return torch.mean(torch.abs(pred_fft - target_fft))
-
-
-class CombinedLoss(nn.Module):
-    """Charbonnier + Frequency — both applied in Y domain."""
-    def __init__(self, lambda_pixel=1.0, lambda_freq=0.1, charbonnier_eps=1e-3):
-        super().__init__()
-        self.lambda_pixel = lambda_pixel
-        self.lambda_freq  = lambda_freq
-        self.charbonnier  = CharbonnierLoss(eps=charbonnier_eps)
-        self.frequency    = FrequencyLoss()
-
-    def forward(self, y_pred, y_clean):
-        """
-        Args:
-            y_pred  : (N, 1, H, W) — denoised Y (model output)
-            y_clean : (N, 1, H, W) — ground truth Y (no noise)
-        """
-        l_pixel = self.charbonnier(y_pred, y_clean)
-        l_freq  = self.frequency(y_pred, y_clean)
-        total   = self.lambda_pixel * l_pixel + self.lambda_freq * l_freq
-        return total, l_pixel, l_freq
+# Using MSELoss(reduction='sum') / (N*2) — matches the original FastDVDnet:
+#   github.com/m-tassano/fastdvdnet/blob/master/train_fastdvdnet.py
+# Applied in Y domain: criterion(y_pred, y_clean)
+# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
@@ -81,8 +49,12 @@ class CombinedLoss(nn.Module):
 
 def validate_and_log(model, dataset_val, valnoisestd, writer, epoch, lr, logger, trainimg):
     """
-    Validation: for each val sequence, add noise to RGB, convert to Y,
-    denoise Y, reconstruct RGB, compute PSNR in RGB space.
+    Validation: add noise to clean RGB, denoise Y, reconstruct RGB using
+    CLEAN UV (passed via seq_clean), compute PSNR in RGB space.
+
+    Passing seq_clean is CRITICAL: without it, denoise_seq_fastdvdnet falls
+    back to extracting UV from the noisy seq, which corrupts the RGB
+    reconstruction and caps PSNR at ~28 dB.
     """
     t1 = _time.time()
     psnr_val = 0.0
@@ -91,15 +63,17 @@ def validate_and_log(model, dataset_val, valnoisestd, writer, epoch, lr, logger,
     with torch.no_grad():
         for seq_val in dataset_val:
             # seq_val: (T, 3, H, W) clean RGB in [0, 1]
-            noise    = torch.FloatTensor(seq_val.size()).normal_(mean=0, std=valnoisestd)
-            seqn_val = (seq_val + noise).clamp(0., 1.).cuda()
-            noisestd = torch.cuda.FloatTensor([valnoisestd])
+            noise          = torch.FloatTensor(seq_val.size()).normal_(mean=0, std=valnoisestd)
+            seqn_val       = (seq_val + noise).clamp(0., 1.).cuda()
+            seq_clean_cuda = seq_val.cuda()                           # clean UV source
+            noisestd       = torch.cuda.FloatTensor([valnoisestd])
 
             out_val = denoise_seq_fastdvdnet(
                 seq=seqn_val,
                 noise_std=noisestd,
                 temp_psz=None,
                 model_temporal=model,
+                seq_clean=seq_clean_cuda,                             # ← clean UV
             )
             psnr_val += batch_psnr(out_val.cpu(), seq_val.squeeze_(), 1.)
 
@@ -155,10 +129,9 @@ def main(**args):
     model = nn.DataParallel(model, device_ids=[0]).cuda()
 
     # ── Loss ──────────────────────────────────────────────────────────────
-    criterion = CombinedLoss(
-        lambda_pixel=args['lambda_pixel'],
-        lambda_freq=args['lambda_freq'],
-    ).cuda()
+    # MSELoss(reduction='sum') / (N*2) — original FastDVDnet convention
+    criterion = nn.MSELoss(reduction='sum')
+    criterion.cuda()
 
     optimizer   = optim.Adam(model.parameters(), lr=args['lr'])
     start_epoch, training_params = resume_training(args, model, optimizer)
@@ -199,9 +172,9 @@ def main(**args):
             rgb_next = img_train[:, 3*t_next:3*t_next+3, :, :]   # (N, 3, H, W)
 
             # Convert each to Y (clean)
-            y_prev, _      = rgb_to_yuv422(rgb_prev)   # (N, 1, H, W)
-            y_curr, uv_curr = rgb_to_yuv422(rgb_curr)  # (N, 1, H, W), (N, 2, H/2, W/2)
-            y_next, _      = rgb_to_yuv422(rgb_next)   # (N, 1, H, W)
+            y_prev, _      = rgb_to_yuv444(rgb_prev)   # (N, 1, H, W)
+            y_curr, uv_curr = rgb_to_yuv444(rgb_curr)  # (N, 1, H, W), (N, 2, H, W) full-res UV  # (N, 1, H, W), (N, 2, H/2, W/2)
+            y_next, _      = rgb_to_yuv444(rgb_next)   # (N, 1, H, W)
 
             # Add Gaussian noise to each Y frame
             noise_prev = torch.normal(mean=torch.zeros_like(y_prev), std=stdn.expand_as(y_prev))
@@ -219,8 +192,8 @@ def main(**args):
             # ── Forward ───────────────────────────────────────────────────
             y_pred = model(y_frames, noise_map)   # (N, 1, H, W)
 
-            # ── Loss in Y domain ──────────────────────────────────────────
-            loss, l_pixel, l_freq = criterion(y_pred, y_clean)
+            # ── Loss in Y domain (original FastDVDnet convention) ─────────
+            loss = criterion(y_pred, y_clean) / (N * 2)
             loss.backward()
             optimizer.step()
 
@@ -229,14 +202,12 @@ def main(**args):
                 if not training_params['no_orthog']:
                     model.apply(svd_orthogonalization)
 
-                writer.add_scalar('loss/total', loss.item(),    training_params['step'])
-                writer.add_scalar('loss/pixel', l_pixel.item(), training_params['step'])
-                writer.add_scalar('loss/freq',  l_freq.item(),  training_params['step'])
+                writer.add_scalar('loss', loss.item(), training_params['step'])
 
                 # Reconstruct RGB for PSNR logging (clean UV, no loss computed on this)
                 with torch.no_grad():
                     uv_clean  = uv_curr.cuda(non_blocking=True)
-                    out_rgb   = yuv422_to_rgb(y_pred.detach(), uv_clean)   # (N, 3, H, W)
+                    out_rgb   = yuv444_to_rgb(y_pred.detach().clamp(0., 1.), uv_clean)   # (N, 3, H, W)
                     gt_rgb    = gt_train.cuda(non_blocking=True)           # (N, 3, H, W)
 
                 log_train_psnr(out_rgb, gt_rgb, loss,
@@ -285,8 +256,6 @@ if __name__ == "__main__":
     parser.add_argument("--patch_size", "--p",       type=int,   default=96)
     parser.add_argument("--temp_patch_size", "--tp", type=int,   default=5)
     parser.add_argument("--max_number_patches","--m",type=int,   default=256000)
-    parser.add_argument("--lambda_pixel",            type=float, default=1.0)
-    parser.add_argument("--lambda_freq",             type=float, default=0.1)
     parser.add_argument("--log_dir",                 type=str,   default="logs")
     parser.add_argument("--trainset_dir",            type=str,   default=None)
     parser.add_argument("--valset_dir",              type=str,   default=None)
@@ -296,7 +265,7 @@ if __name__ == "__main__":
     argspar.noise_ival[0] /= 255.
     argspar.noise_ival[1] /= 255.
 
-    print("\n### Training FastDVDnet (Y-channel 3-frame) ###")
+    print("\n### Training FastDVDnet (Y-channel 3-frame, MSE loss) ###")
     for p, v in zip(argspar.__dict__.keys(), argspar.__dict__.values()):
         print('\t{}: {}'.format(p, v))
     print('\n')

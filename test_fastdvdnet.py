@@ -5,7 +5,7 @@ Denoise sequences using FastDVDnet (Y-channel 3-frame input, no UV in network).
 Pipeline per frame t:
   RGB -> Y (noisy) + UV (clean pass-through)
   model([y_{t-1}, y_t, y_{t+1}], noise_map) -> y_pred
-  RGB = yuv422_to_rgb(y_pred, uv_t)
+  RGB = yuv444_to_rgb(y_pred, uv_t)
 PSNR computed in RGB space for fair comparison with other methods.
 
 Image saving (when --dont_save_results is NOT set):
@@ -13,7 +13,7 @@ Image saving (when --dont_save_results is NOT set):
     <save_path>/output_images_sigma<sigma_int>/
         gt/         <- clean RGB frames,   named 00000.png, 00001.png, ...
         noisy/      <- noisy RGB frames,   named 00000.png, 00001.png, ...
-                       constructed as yuv422_to_rgb(y_noisy, uv_clean)
+                       constructed as yuv444_to_rgb(y_noisy, uv_clean)
                        i.e. noise lives only in Y; UV is kept clean
         denoised/   <- denoised RGB frames, named 00000.png, 00001.png, ...
 
@@ -33,7 +33,7 @@ import cv2
 import torch
 import torch.nn as nn
 
-from models import FastDVDnet, rgb_to_yuv422, yuv422_to_rgb
+from models import FastDVDnet, rgb_to_yuv444, yuv444_to_rgb
 from fastdvdnet import denoise_seq_fastdvdnet
 from utils import (batch_psnr, init_logger_test,
                    variable_to_cv2_image, remove_dataparallel_wrapper,
@@ -77,7 +77,7 @@ def save_image_set(seq_clean, seq_noisy_rgb, seq_denoised,
     Args:
         seq_clean      : (T, 3, H, W) clean RGB tensor in [0, 1]
         seq_noisy_rgb  : (T, 3, H, W) noisy RGB tensor in [0, 1]
-                         constructed as yuv422_to_rgb(y_noisy, uv_clean)
+                         constructed as yuv444_to_rgb(y_noisy, uv_clean)
                          so noise lives in Y only, UV is chroma-clean
         seq_denoised   : (T, 3, H, W) denoised RGB tensor in [0, 1]
         dirs           : dict with keys 'gt', 'noisy', 'denoised' -> folder paths
@@ -114,8 +114,8 @@ def build_noisy_rgb(seq_clean, seq_noisy, device):
 
     For each frame t:
       1. Convert clean RGB -> Y_clean, UV_clean   (UV stays clean)
-      2. Get Y_noisy from the noisy sequence:      Y_noisy, _ = rgb_to_yuv422(seq_noisy[t])
-      3. Reconstruct: yuv422_to_rgb(Y_noisy, UV_clean)  → noisy-Y + clean-UV in RGB
+      2. Get Y_noisy from the noisy sequence:      Y_noisy, _ = rgb_to_yuv444(seq_noisy[t])
+      3. Reconstruct: yuv444_to_rgb(Y_noisy, UV_clean)  → noisy-Y + clean-UV in RGB
 
     This gives a perceptually accurate noisy image (luma noise visible,
     chroma intact) and matches how noise is injected during training.
@@ -133,13 +133,13 @@ def build_noisy_rgb(seq_clean, seq_noisy, device):
 
     for t in range(T):
         # Extract clean UV from the clean frame (chroma stays noise-free)
-        _, uv_clean = rgb_to_yuv422(seq_clean[t].unsqueeze(0).to(device))   # (1,2,H/2,W/2)
+        _, uv_clean = rgb_to_yuv444(seq_clean[t].unsqueeze(0).to(device))   # (1, 2, H, W) full-res UV
 
         # Extract noisy Y from the noisy frame
-        y_noisy, _  = rgb_to_yuv422(seq_noisy[t].unsqueeze(0).to(device))   # (1,1,H,W)
+        y_noisy, _  = rgb_to_yuv444(seq_noisy[t].unsqueeze(0).to(device))   # (1, 1, H, W)
 
         # Reconstruct RGB: noisy luma + clean chroma
-        noisy_rgb[t] = yuv422_to_rgb(y_noisy, uv_clean).squeeze(0).cpu()    # (3,H,W)
+        noisy_rgb[t] = yuv444_to_rgb(y_noisy, uv_clean).squeeze(0).cpu()    # (3,H,W)
 
     return noisy_rgb
 
@@ -209,12 +209,16 @@ def test_fastdvdnet(**args):
             seqn     = (seq + noise).clamp(0., 1.)
             noisestd = torch.FloatTensor([args['noise_sigma']]).to(device)
 
-            # Denoise: Y-channel 3-frame sliding window, UV passed clean
+            # Denoise: Y-channel 3-frame sliding window
+            # CRITICAL: pass seq (the clean RGB) as seq_clean so UV is extracted
+            # from the clean frame. Without this, UV defaults to the noisy frame
+            # and caps RGB PSNR around 28 dB.
             denframes = denoise_seq_fastdvdnet(
                 seq=seqn,
                 noise_std=noisestd,
                 temp_psz=None,
                 model_temporal=model_temp,
+                seq_clean=seq,                                        # ← clean UV
             )
 
             run_t      = time.time() - seq_start - load_t
