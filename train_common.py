@@ -14,7 +14,7 @@ def	resume_training(argdict, model, optimizer):
 	if argdict['resume_training']:
 		resumef = os.path.join(argdict['log_dir'], 'ckpt.pth')
 		if os.path.isfile(resumef):
-			checkpoint = torch.load(resumef)
+			checkpoint = torch.load(resumef, weights_only=False)
 			print("> Resuming previous training")
 			model.load_state_dict(checkpoint['state_dict'])
 			optimizer.load_state_dict(checkpoint['optimizer'])

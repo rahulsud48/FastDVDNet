@@ -4,4 +4,5 @@ python train_fastdvdnet.py \
   --log_dir logs_actual_noise \
   --batch_size 4 \
   --epochs 80 \
-  --max_number_patches 256000 
+  --max_number_patches 256000 \
+  --resume_training
