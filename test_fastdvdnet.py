@@ -69,10 +69,10 @@ OUTIMGEXT = '.png'
 # NEW saving function
 # ---------------------------------------------------------------------------
 
-def save_image_set(seq_clean, seq_noisy_rgb, seq_denoised,
-                   dirs, global_frame_idx):
+def save_image_set(seq_clean, seq_noisy_rgb, seq_denoised, dirs):
     """
     Saves one sequence worth of frames into the gt / noisy / denoised folders.
+    Frame numbering resets to 00000 within each sequence (per-sequence layout).
 
     Args:
         seq_clean      : (T, 3, H, W) clean RGB tensor in [0, 1]
@@ -81,17 +81,12 @@ def save_image_set(seq_clean, seq_noisy_rgb, seq_denoised,
                          so noise lives in Y only, UV is chroma-clean
         seq_denoised   : (T, 3, H, W) denoised RGB tensor in [0, 1]
         dirs           : dict with keys 'gt', 'noisy', 'denoised' -> folder paths
-        global_frame_idx : int, frame counter before this sequence starts
-                           (so filenames are unique across all sequences)
-
-    Returns:
-        global_frame_idx updated by T (number of frames saved)
     """
     T = seq_clean.size(0)
 
     for t in range(T):
-        # Zero-padded filename, e.g. 00000.png, 00001.png, ...
-        fname = '{:05d}{}'.format(global_frame_idx + t, OUTIMGEXT)
+        # Zero-padded filename, resets per sequence: 00000.png, 00001.png, ...
+        fname = '{:05d}{}'.format(t, OUTIMGEXT)
 
         # ── Ground truth ──────────────────────────────────────────────────
         gt_img = variable_to_cv2_image(seq_clean[t].unsqueeze(0).clamp(0., 1.))
@@ -104,8 +99,6 @@ def save_image_set(seq_clean, seq_noisy_rgb, seq_denoised,
         # ── Denoised ──────────────────────────────────────────────────────
         den_img = variable_to_cv2_image(seq_denoised[t].unsqueeze(0).clamp(0., 1.))
         cv2.imwrite(os.path.join(dirs['denoised'], fname), den_img)
-
-    return global_frame_idx + T
 
 
 def build_noisy_rgb(seq_clean, seq_noisy, device):
@@ -176,26 +169,21 @@ def test_fastdvdnet(**args):
     # Folder: <save_path>/output_images_sigma<sigma_int>/gt|noisy|denoised
     # sigma_int is the integer sigma value (e.g. 25 for noise_sigma=25/255)
     if not args['dont_save_results']:
-        sigma_int   = int(args['noise_sigma'] * 255)
-        output_root = os.path.join(args['save_path'],
-                                   'output_images_sigma{}'.format(sigma_int))
-        save_dirs = {
-            'gt':       os.path.join(output_root, 'gt'),
-            'noisy':    os.path.join(output_root, 'noisy'),
-            'denoised': os.path.join(output_root, 'denoised'),
-        }
-        for d in save_dirs.values():
-            os.makedirs(d, exist_ok=True)
-        print('Saving images to: {}'.format(output_root))
+        sigma_int   = int(round(args['noise_sigma'] * 255))
+        # Root: <save_path>/pred_sigma<sigma_int>/
+        # Per-sequence: pred_sigma<sigma>/<seq_name>/{gt,noisy,denoised}/00000.png
+        pred_root = os.path.join(args['save_path'], 'pred_sigma{}'.format(sigma_int))
+        os.makedirs(pred_root, exist_ok=True)
+        print('Saving per-sequence images to: {}'.format(pred_root))
 
     psnr_all         = []
     psnr_noisy_all   = []   # per-sequence noisy PSNR, for the summary table
     seq_names        = []   # sequence folder names, for the summary table
-    global_frame_idx = 0    # running frame counter across all sequences
 
     with torch.no_grad():
         for seq_dir in seq_dirs:
             seq_start = time.time()
+            seq_name  = os.path.basename(seq_dir.rstrip('/'))
 
             # Load clean RGB sequence
             seq, _, _ = open_sequence(seq_dir, args['gray'],
@@ -204,9 +192,9 @@ def test_fastdvdnet(**args):
             seq    = torch.from_numpy(seq).to(device)    # (T, 3, H, W) RGB [0,1]
             load_t = time.time() - seq_start
 
-            # Add noise to RGB
+            # Add noise to RGB — NOT clamped (preserve Gaussian stats, matches original)
             noise    = torch.empty_like(seq).normal_(mean=0, std=args['noise_sigma'])
-            seqn     = (seq + noise).clamp(0., 1.)
+            seqn     = (seq + noise)
             noisestd = torch.FloatTensor([args['noise_sigma']]).to(device)
 
             # Denoise: Y-channel 3-frame sliding window
@@ -228,7 +216,7 @@ def test_fastdvdnet(**args):
             # Accumulate per-sequence results for the summary table
             psnr_all.append(psnr)
             psnr_noisy_all.append(psnr_noisy)
-            seq_names.append(os.path.basename(seq_dir.rstrip('/')))
+            seq_names.append(seq_name)
 
             logger.info("Finished: {}".format(seq_dir))
             logger.info("\tFrames: {}  Load: {:.3f}s  Denoise: {:.3f}s".format(
@@ -236,21 +224,28 @@ def test_fastdvdnet(**args):
             logger.info("\tPSNR noisy: {:.4f} dB  PSNR denoised: {:.4f} dB".format(
                 psnr_noisy, psnr))
 
-            # ── Save results ──────────────────────────────────────────────
+            # ── Save results (per-sequence layout) ─────────────────────────
             if not args['dont_save_results']:
 
                 # Build noisy RGB: noise in Y only, UV stays clean
                 # This matches the training noise injection convention
                 seq_noisy_rgb = build_noisy_rgb(seq.cpu(), seqn.cpu(), device)
 
-                # Save gt / noisy / denoised for this sequence;
-                # global_frame_idx advances so filenames are unique across sequences
-                global_frame_idx = save_image_set(
+                # Per-sequence folders: pred_sigma<>/<seq>/{gt,noisy,denoised}
+                seq_dirs_out = {
+                    'gt':       os.path.join(pred_root, seq_name, 'gt'),
+                    'noisy':    os.path.join(pred_root, seq_name, 'noisy'),
+                    'denoised': os.path.join(pred_root, seq_name, 'denoised'),
+                }
+                for d in seq_dirs_out.values():
+                    os.makedirs(d, exist_ok=True)
+
+                # Frame numbering resets to 00000 within each sequence
+                save_image_set(
                     seq_clean=seq.cpu(),
                     seq_noisy_rgb=seq_noisy_rgb,
                     seq_denoised=denframes.cpu(),
-                    dirs=save_dirs,
-                    global_frame_idx=global_frame_idx,
+                    dirs=seq_dirs_out,
                 )
 
                 # ── OLD per-sequence saving — commented out ───────────────

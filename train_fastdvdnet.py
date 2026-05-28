@@ -30,7 +30,7 @@ from dataset import ValDataset
 from simple_dataloader import train_simple_loader
 from utils import svd_orthogonalization, close_logger, init_logging, normalize_augment, batch_psnr
 from train_common import (resume_training, lr_scheduler, log_train_psnr,
-                          save_model_checkpoint)
+                          save_model_checkpoint, save_best_model)
 from fastdvdnet import denoise_seq_fastdvdnet
 
 
@@ -63,8 +63,9 @@ def validate_and_log(model, dataset_val, valnoisestd, writer, epoch, lr, logger,
     with torch.no_grad():
         for seq_val in dataset_val:
             # seq_val: (T, 3, H, W) clean RGB in [0, 1]
+            # Noisy input is NOT clamped (preserve Gaussian stats — matches original)
             noise          = torch.FloatTensor(seq_val.size()).normal_(mean=0, std=valnoisestd)
-            seqn_val       = (seq_val + noise).clamp(0., 1.).cuda()
+            seqn_val       = (seq_val + noise).cuda()
             seq_clean_cuda = seq_val.cuda()                           # clean UV source
             noisestd       = torch.cuda.FloatTensor([valnoisestd])
 
@@ -95,6 +96,8 @@ def validate_and_log(model, dataset_val, valnoisestd, writer, epoch, lr, logger,
         writer.add_image('Reconstructed validation image {}'.format(idx), irecon, epoch)
     except Exception as e:
         logger.error("validate_and_log(): {}".format(e))
+
+    return psnr_val
 
 
 # ---------------------------------------------------------------------------
@@ -135,15 +138,42 @@ def main(**args):
 
     optimizer   = optim.Adam(model.parameters(), lr=args['lr'])
     start_epoch, training_params = resume_training(args, model, optimizer)
-    start_time  = time.time()
+
+    # ── LR scheduling ─────────────────────────────────────────────────────
+    # Linear warmup for the first `warmup_epochs`, then ReduceLROnPlateau on
+    # validation PSNR (mode='max'): when val PSNR stops improving for
+    # `lr_patience` epochs, multiply LR by `lr_factor`. This gives more
+    # learning in later epochs by lowering LR only when progress stalls.
+    plateau_sched = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode='max',
+        factor=args['lr_factor'],
+        patience=args['lr_patience'],
+        min_lr=args['min_lr'],
+    )
+
+    best_psnr  = -1.0
+    best_epoch = -1
+    start_time = time.time()
 
     for epoch in range(start_epoch, args['epochs']):
 
-        current_lr, reset_orthog = lr_scheduler(epoch, args)
+        # ── Warmup: linearly ramp LR from 0 → base lr over warmup_epochs ──
+        if epoch < args['warmup_epochs'] and args['warmup_epochs'] > 0:
+            warmup_lr = args['lr'] * float(epoch + 1) / float(args['warmup_epochs'])
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = warmup_lr
+            current_lr   = warmup_lr
+            reset_orthog = False
+        else:
+            # After warmup, LR is governed by the plateau scheduler (applied at
+            # the END of each epoch using val PSNR). Read the current value here.
+            current_lr   = optimizer.param_groups[0]['lr']
+            # Keep orthogonalization reset behaviour tied to the milestone epochs
+            reset_orthog = epoch > args['milestone'][1]
+
         if reset_orthog:
             training_params['no_orthog'] = True
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = current_lr
         print('\nlearning rate %f' % current_lr)
 
         for i, data in enumerate(loader_train, 0):
@@ -177,13 +207,17 @@ def main(**args):
             y_next, _      = rgb_to_yuv444(rgb_next)   # (N, 1, H, W)
 
             # Add Gaussian noise to each Y frame
+            # NOTE: noisy input is NOT clamped — clamping would distort the
+            # Gaussian noise distribution near 0/1, making the actual noise
+            # statistics diverge from what noise_map advertises to the model.
+            # This matches the original FastDVDnet (imgn_train = img_train + noise).
             noise_prev = torch.normal(mean=torch.zeros_like(y_prev), std=stdn.expand_as(y_prev))
             noise_curr = torch.normal(mean=torch.zeros_like(y_curr), std=stdn.expand_as(y_curr))
             noise_next = torch.normal(mean=torch.zeros_like(y_next), std=stdn.expand_as(y_next))
 
-            yn_prev = (y_prev + noise_prev).clamp(0., 1.).cuda(non_blocking=True)
-            yn_curr = (y_curr + noise_curr).clamp(0., 1.).cuda(non_blocking=True)
-            yn_next = (y_next + noise_next).clamp(0., 1.).cuda(non_blocking=True)
+            yn_prev = (y_prev + noise_prev).cuda(non_blocking=True)
+            yn_curr = (y_curr + noise_curr).cuda(non_blocking=True)
+            yn_next = (y_next + noise_next).cuda(non_blocking=True)
 
             y_frames  = torch.cat([yn_prev, yn_curr, yn_next], dim=1)   # (N, 3, H, W)
             y_clean   = y_curr.cuda(non_blocking=True)                  # (N, 1, H, W) target
@@ -216,7 +250,7 @@ def main(**args):
             training_params['step'] += 1
 
         # ── Validation ────────────────────────────────────────────────────
-        validate_and_log(
+        psnr_val = validate_and_log(
             model=model.module,
             dataset_val=dataset_val,
             valnoisestd=args['val_noiseL'],
@@ -227,11 +261,28 @@ def main(**args):
             trainimg=img_train,
         )
 
+        # ── Step the plateau scheduler (only after warmup is over) ─────────
+        if epoch >= args['warmup_epochs']:
+            plateau_sched.step(psnr_val)
+
         training_params['start_epoch'] = epoch + 1
         save_model_checkpoint(model, args, optimizer, training_params, epoch)
 
+        # ── Save best model by validation PSNR ─────────────────────────────
+        if psnr_val > best_psnr:
+            best_psnr  = psnr_val
+            best_epoch = epoch + 1
+            save_best_model(model, args, optimizer, training_params, epoch, psnr_val)
+            msg = "  >> New best model: PSNR_val %.4f dB at epoch %d (saved net_best.pth)" % (
+                best_psnr, best_epoch)
+            print(msg)
+            logger.info(msg)
+        else:
+            print("  (best so far: %.4f dB at epoch %d)" % (best_psnr, best_epoch))
+
     elapsed = time.time() - start_time
     print('Elapsed time {}'.format(time.strftime("%H:%M:%S", time.gmtime(elapsed))))
+    logger.info("Best validation PSNR: %.4f dB at epoch %d" % (best_psnr, best_epoch))
     close_logger(logger)
 
 
@@ -256,6 +307,15 @@ if __name__ == "__main__":
     parser.add_argument("--patch_size", "--p",       type=int,   default=96)
     parser.add_argument("--temp_patch_size", "--tp", type=int,   default=5)
     parser.add_argument("--max_number_patches","--m",type=int,   default=256000)
+    # ── LR warmup + plateau scheduling ──────────────────────────────────
+    parser.add_argument("--warmup_epochs",          type=int,   default=3,
+                        help="Linear LR warmup over the first N epochs (0 disables)")
+    parser.add_argument("--lr_factor",              type=float, default=0.5,
+                        help="ReduceLROnPlateau: multiply LR by this when val PSNR stalls")
+    parser.add_argument("--lr_patience",            type=int,   default=5,
+                        help="ReduceLROnPlateau: epochs to wait before reducing LR")
+    parser.add_argument("--min_lr",                 type=float, default=1e-6,
+                        help="ReduceLROnPlateau: lower bound on LR")
     parser.add_argument("--log_dir",                 type=str,   default="logs")
     parser.add_argument("--trainset_dir",            type=str,   default=None)
     parser.add_argument("--valset_dir",              type=str,   default=None)

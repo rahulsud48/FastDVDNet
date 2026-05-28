@@ -71,16 +71,17 @@ def lr_scheduler(epoch, argdict):
 		current_lr = argdict['lr']
 	return current_lr, reset_orthog
 
-def log_train_psnr(result, imsource, loss, writer, epoch, idx, num_minibatches, training_params):
-    """Logs train loss and train PSNR."""
-    psnr_train = batch_psnr(torch.clamp(result, 0., 1.), imsource, 1.0)
+def	log_train_psnr(result, imsource, loss, writer, epoch, idx, num_minibatches, training_params):
+	'''Logs train loss and train PSNR.'''
+	# Compute PSNR of the whole batch (result and imsource are RGB in [0,1])
+	psnr_train = batch_psnr(torch.clamp(result, 0., 1.), imsource, 1.)
 
-    writer.add_scalar('loss', loss.item(), training_params['step'])
-    writer.add_scalar('PSNR on training data', psnr_train, training_params['step'])
+	# Log the scalar values
+	writer.add_scalar('loss', loss.item(), training_params['step'])
+	writer.add_scalar('PSNR on training data', psnr_train, training_params['step'])
 
-    print("[epoch {}][{}/{}] loss: {:1.4f} PSNR_train: {:1.4f}".format(
-        epoch + 1, idx + 1, num_minibatches, loss.item(), psnr_train
-    ))
+	print("[epoch {}][{}/{}] loss: {:1.4f} PSNR_train: {:1.4f}".\
+		  format(epoch+1, idx+1, num_minibatches, loss.item(), psnr_train))
 
 def save_model_checkpoint(model, argdict, optimizer, train_pars, epoch):
 	"""Stores the model parameters under 'argdict['log_dir'] + '/net.pth'
@@ -97,6 +98,22 @@ def save_model_checkpoint(model, argdict, optimizer, train_pars, epoch):
 
 	if epoch % argdict['save_every_epochs'] == 0:
 		torch.save(save_dict, os.path.join(argdict['log_dir'], 'ckpt_e{}.pth'.format(epoch+1)))
+	del save_dict
+
+def save_best_model(model, argdict, optimizer, train_pars, epoch, psnr_val):
+	"""Saves the best model (by validation PSNR) under 'net_best.pth' and
+	'ckpt_best.pth'. Call only when a new best val PSNR is achieved.
+	"""
+	torch.save(model.state_dict(), os.path.join(argdict['log_dir'], 'net_best.pth'))
+	save_dict = {
+		'state_dict': model.state_dict(),
+		'optimizer': optimizer.state_dict(),
+		'training_params': train_pars,
+		'args': argdict,
+		'best_psnr': psnr_val,
+		'best_epoch': epoch + 1,
+	}
+	torch.save(save_dict, os.path.join(argdict['log_dir'], 'ckpt_best.pth'))
 	del save_dict
 
 def validate_and_log(model_temp, dataset_val, valnoisestd, temp_psz, writer, \

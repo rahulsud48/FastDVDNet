@@ -1,0 +1,1 @@
+python make_comparison_video.py --pred_dir result_y_only_v2/pred_sigma25 --fps 15
