@@ -51,7 +51,7 @@ def temp_denoise(model, y_frames, noise_map):
 
 
 def denoise_seq_fastdvdnet(seq, noise_std, temp_psz, model_temporal,
-                           seq_clean=None, bank_size=None):
+                           seq_clean=None, bank_size=None, return_y=False):
     """
     Denoises a sequence of RGB frames using Y-channel 3-frame sliding window.
 
@@ -70,13 +70,23 @@ def denoise_seq_fastdvdnet(seq, noise_std, temp_psz, model_temporal,
                         Pass during validation/test for correct PSNR.
                         If None, UV falls back to the noisy frame.
         bank_size     : unused, kept for API compatibility
+        return_y      : if True, also return the per-frame Y tensors actually
+                        seen/produced by the model:
+                          y_noisy_seq    : (T, 1, H, W) — noisy central Y (model input)
+                          y_denoised_seq : (T, 1, H, W) — model output Y
+                        These are the raw Y tensors (no RGB round-trip).
 
     Returns:
-        denframes : (T, 3, H, W) RGB float32 in [0, 1]
+        denframes                                    if return_y is False
+        (denframes, y_noisy_seq, y_denoised_seq)     if return_y is True
     """
     T, C, H, W = seq.shape
     denframes  = torch.empty((T, 3, H, W), device=seq.device)
     noise_map  = noise_std.expand((1, 1, H, W))
+
+    if return_y:
+        y_noisy_seq    = torch.empty((T, 1, H, W), device=seq.device)
+        y_denoised_seq = torch.empty((T, 1, H, W), device=seq.device)
 
     # UV source: clean frames preferred; noisy frames as fallback
     uv_source = seq_clean if seq_clean is not None else seq
@@ -101,5 +111,13 @@ def denoise_seq_fastdvdnet(seq, noise_std, temp_psz, model_temporal,
         # Clamp y_pred at output boundary (not inside model, so loss gets raw gradients)
         denframes[t] = yuv444_to_rgb(y_pred.clamp(0., 1.), uv_t).squeeze(0)
 
+        if return_y:
+            # Store the exact tensors the model saw / produced (central frame)
+            y_noisy_seq[t]    = y_curr.squeeze(0)   # noisy central Y (model input)
+            y_denoised_seq[t] = y_pred.squeeze(0)   # model output Y (unclamped)
+
     torch.cuda.empty_cache()
+
+    if return_y:
+        return denframes, y_noisy_seq, y_denoised_seq
     return denframes

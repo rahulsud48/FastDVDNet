@@ -142,26 +142,39 @@ def build_composites(seq_dir, add_labels):
 # Encoders
 # ---------------------------------------------------------------------------
 
-def write_mp4_ffmpeg(seq_dir, composites, n, out_W, H, fps, player_safe=False):
+def write_mp4_ffmpeg(seq_dir, composites, n, out_W, H, fps, player_safe=False, gray_video=False):
     """Lossless MP4 via ffmpeg. Pipes raw BGR24 frames to ffmpeg.
 
-    Two modes:
-      - Default (player_safe=False): libx264rgb -crf 0. Encodes RGB directly with
-        NO colour-space conversion → bit-exact (pixel-identical to source PNGs).
-        Plays in VLC/mpv and most modern players.
-      - player_safe=True: libx264 -crf 0 -pix_fmt yuv444p. Goes through an RGB→YUV
-        conversion so it's "visually lossless" (±1-2 per channel) rather than
-        bit-exact, but is compatible with the widest range of basic players.
+    Modes:
+      - gray_video=True: libx264 -crf 0 -pix_fmt yuv420p (crf 0). Lossless on the luma plane.
+        For grayscale content (the Y panels) this is lossless on the luma plane
+        and plays in EVERY player (GNOME/Totem, browsers, phones) with no
+        striping. The chroma planes are flat (no colour), so 4:2:0 costs nothing.
+        This is the recommended mode for the Y-only side-by-side.
+      - Default (player_safe=False): libx264rgb -crf 0. Bit-exact RGB, but uses
+        the High 4:4:4 profile which some basic players can't decode (shows
+        magenta/green striping). Use for colour content with VLC/mpv.
+      - player_safe=True: libx264 -crf 0 -pix_fmt yuv444p (±1-2, colour).
 
     Returns the output path on success, raises on failure.
     """
     seq_name = os.path.basename(seq_dir.rstrip('/'))
     out_path = os.path.join(seq_dir, 'comparison_{}.mp4'.format(seq_name))
 
-    if player_safe:
+    if gray_video:
+        # yuv420p + faststart → maximum compatibility, no striping.
+        # NOTE: do NOT force -profile:v high; the High profile rejects lossless
+        # (crf 0). With crf 0 + yuv420p, libx264 picks a compatible lossless
+        # profile automatically, which still plays in every standard player.
+        codec_args = ['-vcodec', 'libx264', '-crf', '0', '-pix_fmt', 'yuv420p',
+                      '-movflags', '+faststart']
+        mode = "grayscale-safe yuv420p"
+    elif player_safe:
         codec_args = ['-vcodec', 'libx264', '-crf', '0', '-pix_fmt', 'yuv444p']
+        mode = "visually lossless yuv444p"
     else:
         codec_args = ['-vcodec', 'libx264rgb', '-crf', '0']   # bit-exact, no RGB→YUV
+        mode = "bit-exact libx264rgb"
 
     cmd = [
         'ffmpeg', '-y',
@@ -191,7 +204,6 @@ def write_mp4_ffmpeg(seq_dir, composites, n, out_W, H, fps, player_safe=False):
         err = proc.stderr.read().decode('utf-8', errors='ignore')[-1500:]
         raise RuntimeError("ffmpeg failed (code {}):\n{}".format(ret, err))
 
-    mode = "visually lossless yuv444p" if player_safe else "bit-exact libx264rgb"
     print("  [ok]  {} → {}  ({} frames, {}x{}, {})".format(
         seq_name, os.path.basename(out_path), n, out_W, H, mode))
     return out_path
@@ -216,7 +228,7 @@ def write_mkv_ffv1(seq_dir, composites, n, out_W, H, fps):
     return out_path
 
 
-def build_video_for_sequence(seq_dir, fps, add_labels, use_ffmpeg, player_safe=False):
+def build_video_for_sequence(seq_dir, fps, add_labels, use_ffmpeg, player_safe=False, gray_video=False):
     """Builds one lossless comparison video for a single sequence folder."""
     composites, n, out_W, H = build_composites(seq_dir, add_labels)
     if composites is None:
@@ -224,7 +236,8 @@ def build_video_for_sequence(seq_dir, fps, add_labels, use_ffmpeg, player_safe=F
 
     try:
         if use_ffmpeg:
-            write_mp4_ffmpeg(seq_dir, composites, n, out_W, H, fps, player_safe=player_safe)
+            write_mp4_ffmpeg(seq_dir, composites, n, out_W, H, fps,
+                             player_safe=player_safe, gray_video=gray_video)
         else:
             write_mkv_ffv1(seq_dir, composites, n, out_W, H, fps)
         return True
@@ -254,6 +267,10 @@ def main():
     parser.add_argument("--player_safe", action='store_true',
                         help="MP4: use yuv444p (visually lossless, ±1-2) for max player "
                              "compatibility instead of bit-exact libx264rgb")
+    parser.add_argument("--gray_video", action='store_true',
+                        help="Encode grayscale-safe MP4 (yuv420p grayscale-safe). "
+                             "Recommended for the Y-only side-by-side (pred_sigma<val>_y) "
+                             "— plays in every player with no striping.")
 
     args = parser.parse_args()
     add_labels = not args.no_labels
@@ -264,7 +281,9 @@ def main():
         print("Encoder: FFV1/MKV (forced via --force_mkv)")
     elif have_ffmpeg():
         use_ffmpeg = True
-        if args.player_safe:
+        if args.gray_video:
+            print("Encoder: ffmpeg libx264 -crf 0 -pix_fmt yuv420p (grayscale-safe lossless MP4)")
+        elif args.player_safe:
             print("Encoder: ffmpeg libx264 -crf 0 -pix_fmt yuv444p (visually lossless MP4)")
         else:
             print("Encoder: ffmpeg libx264rgb -crf 0 (bit-exact lossless MP4)")
@@ -291,11 +310,17 @@ def main():
     n_ok = 0
     for sd in seq_dirs:
         if build_video_for_sequence(sd, fps=args.fps, add_labels=add_labels,
-                                    use_ffmpeg=use_ffmpeg, player_safe=args.player_safe):
+                                    use_ffmpeg=use_ffmpeg, player_safe=args.player_safe,
+                                    gray_video=args.gray_video):
             n_ok += 1
 
     if use_ffmpeg:
-        fmt = "MP4 (yuv444p visually lossless)" if args.player_safe else "MP4 (libx264rgb bit-exact)"
+        if args.gray_video:
+            fmt = "MP4 (yuv420p grayscale-safe)"
+        elif args.player_safe:
+            fmt = "MP4 (yuv444p visually lossless)"
+        else:
+            fmt = "MP4 (libx264rgb bit-exact)"
     else:
         fmt = "MKV (FFV1 lossless)"
     print("\nDone. {}/{} videos written as {}.".format(n_ok, len(seq_dirs), fmt))

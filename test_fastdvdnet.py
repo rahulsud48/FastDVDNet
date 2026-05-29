@@ -101,6 +101,33 @@ def save_image_set(seq_clean, seq_noisy_rgb, seq_denoised, dirs):
         cv2.imwrite(os.path.join(dirs['denoised'], fname), den_img)
 
 
+def _y_to_gray_uint8(y_frame):
+    """Converts a single Y frame (1, H, W) or (H, W) float in [0,1] to a
+    HxW uint8 grayscale image, clamping to [0,1] for display."""
+    arr = y_frame.detach().cpu().squeeze().clamp(0., 1.).numpy()   # (H, W)
+    return (arr * 255.).round().clip(0, 255).astype('uint8')
+
+
+def save_y_image_set(y_clean, y_noisy, y_denoised, dirs):
+    """
+    Saves one sequence worth of GRAYSCALE Y frames into gt/noisy/denoised folders.
+    These are the exact Y tensors the model sees/produces (no RGB round-trip).
+    Frame numbering resets per sequence: 00000.png, 00001.png, ...
+
+    Args:
+        y_clean    : (T, 1, H, W) clean Y (ground truth luma)
+        y_noisy    : (T, 1, H, W) noisy Y — the model input central frame
+        y_denoised : (T, 1, H, W) denoised Y — the model output
+        dirs       : dict with keys 'gt', 'noisy', 'denoised' -> folder paths
+    """
+    T = y_clean.size(0)
+    for t in range(T):
+        fname = '{:05d}{}'.format(t, OUTIMGEXT)
+        cv2.imwrite(os.path.join(dirs['gt'],       fname), _y_to_gray_uint8(y_clean[t]))
+        cv2.imwrite(os.path.join(dirs['noisy'],    fname), _y_to_gray_uint8(y_noisy[t]))
+        cv2.imwrite(os.path.join(dirs['denoised'], fname), _y_to_gray_uint8(y_denoised[t]))
+
+
 def build_noisy_rgb(seq_clean, seq_noisy, device):
     """
     Constructs a 'visualisable' noisy RGB sequence where noise lives in Y only.
@@ -174,7 +201,13 @@ def test_fastdvdnet(**args):
         # Per-sequence: pred_sigma<sigma>/<seq_name>/{gt,noisy,denoised}/00000.png
         pred_root = os.path.join(args['save_path'], 'pred_sigma{}'.format(sigma_int))
         os.makedirs(pred_root, exist_ok=True)
-        print('Saving per-sequence images to: {}'.format(pred_root))
+        print('Saving per-sequence RGB images to: {}'.format(pred_root))
+
+        # Optional: separate grayscale-Y root (the exact model input/output luma)
+        if args['save_y_only']:
+            pred_root_y = os.path.join(args['save_path'], 'pred_sigma{}_y'.format(sigma_int))
+            os.makedirs(pred_root_y, exist_ok=True)
+            print('Saving per-sequence Y (grayscale) images to: {}'.format(pred_root_y))
 
     psnr_all         = []
     psnr_noisy_all   = []   # per-sequence noisy PSNR, for the summary table
@@ -201,13 +234,24 @@ def test_fastdvdnet(**args):
             # CRITICAL: pass seq (the clean RGB) as seq_clean so UV is extracted
             # from the clean frame. Without this, UV defaults to the noisy frame
             # and caps RGB PSNR around 28 dB.
-            denframes = denoise_seq_fastdvdnet(
-                seq=seqn,
-                noise_std=noisestd,
-                temp_psz=None,
-                model_temporal=model_temp,
-                seq_clean=seq,                                        # ← clean UV
-            )
+            want_y = args['save_y_only'] and not args['dont_save_results']
+            if want_y:
+                denframes, y_noisy_seq, y_denoised_seq = denoise_seq_fastdvdnet(
+                    seq=seqn,
+                    noise_std=noisestd,
+                    temp_psz=None,
+                    model_temporal=model_temp,
+                    seq_clean=seq,                                    # ← clean UV
+                    return_y=True,                                    # ← also get Y tensors
+                )
+            else:
+                denframes = denoise_seq_fastdvdnet(
+                    seq=seqn,
+                    noise_std=noisestd,
+                    temp_psz=None,
+                    model_temporal=model_temp,
+                    seq_clean=seq,                                    # ← clean UV
+                )
 
             run_t      = time.time() - seq_start - load_t
             psnr       = batch_psnr(denframes, seq, 1.)
@@ -247,6 +291,29 @@ def test_fastdvdnet(**args):
                     seq_denoised=denframes.cpu(),
                     dirs=seq_dirs_out,
                 )
+
+                # ── Optional grayscale-Y dump (exact model luma) ──────────
+                if args['save_y_only']:
+                    # Clean Y straight from the clean RGB (ground-truth luma)
+                    y_clean_seq = torch.empty((seq.size(0), 1, seq.size(2), seq.size(3)))
+                    for t in range(seq.size(0)):
+                        yt, _ = rgb_to_yuv444(seq[t].unsqueeze(0).to(device))
+                        y_clean_seq[t] = yt.squeeze(0).cpu()
+
+                    seq_y_dirs_out = {
+                        'gt':       os.path.join(pred_root_y, seq_name, 'gt'),
+                        'noisy':    os.path.join(pred_root_y, seq_name, 'noisy'),
+                        'denoised': os.path.join(pred_root_y, seq_name, 'denoised'),
+                    }
+                    for d in seq_y_dirs_out.values():
+                        os.makedirs(d, exist_ok=True)
+
+                    save_y_image_set(
+                        y_clean=y_clean_seq,                 # clean Y (gt)
+                        y_noisy=y_noisy_seq.cpu(),           # noisy Y (model input)
+                        y_denoised=y_denoised_seq.cpu(),     # denoised Y (model output)
+                        dirs=seq_y_dirs_out,
+                    )
 
                 # ── OLD per-sequence saving — commented out ───────────────
                 # To restore: uncomment the block below and comment out the
@@ -323,6 +390,9 @@ if __name__ == "__main__":
     parser.add_argument("--save_noisy",         action='store_true')
     parser.add_argument("--no_gpu",             action='store_true')
     parser.add_argument("--gray",               action='store_true')
+    parser.add_argument("--save_y_only",        action='store_true',
+                        help="Also dump grayscale Y (gt/noisy/denoised) — the exact "
+                             "model input/output luma — to a separate pred_sigma<val>_y/ root")
 
     argspar = parser.parse_args()
     argspar.noise_sigma /= 255.
