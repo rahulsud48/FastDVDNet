@@ -70,3 +70,11 @@ train_log.txt
 logs_actual_noise/
 results_kvbank_actual_noise/
 logs_testing/
+logs_y_only_v2/
+result_y_only/
+.gitignore
+result_y_only_noisy_RGB/
+result_y_only_v2/
+train_logs1.txt
+logs_y_only/
+logs_y_only_noisy_RGB/
