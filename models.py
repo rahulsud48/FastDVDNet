@@ -3,7 +3,9 @@ FastDVDnet — Single-frame input with KV Bank cross-attention at bottleneck.
 
 Changes from uploaded version:
   - InputCvBlock now accepts 5 channels: RGB(3) + sigma_read(1) + lambda_shot(1)
-  - Everything else identical to the uploaded working version
+  - AdaptiveAvgPool2d replaced with depthwise strided Conv2d for compiler compatibility
+    Input to pool: (N, 128, 67, 120) for H=270, W=480 (i.e. 1080/4 x 1920/4)
+    kernel=(9,15), stride=(8,15), padding=(1,0), groups=128 → output (N, 128, 8, 8)
 """
 
 import torch
@@ -118,9 +120,44 @@ class KVBank:
 
 
 class BottleneckCrossAttn(nn.Module):
-    def __init__(self, ch: int = 128, num_heads: int = 4, pool_size: int = 8):
+    """
+    Cross-attention at bottleneck using a depthwise strided Conv2d for spatial pooling.
+
+    Replaces AdaptiveAvgPool2d(pool_size) with a learnable depthwise conv that
+    produces the same (N, ch, pool_size, pool_size) output shape.
+
+    For the default input resolution 1080x1920 (stored as H=270, W=480 after /4 crop),
+    the bottleneck feature map arriving here is (N, 128, 67, 120) after two stride-2
+    downsamples. To reach (N, 128, 8, 8):
+
+        H: kernel=9, stride=8, padding=1
+           → floor((67 + 2*1 - 9) / 8) + 1 = floor(60/8) + 1 = 8  ✓
+        W: kernel=15, stride=15, padding=0
+           → floor((120 + 0 - 15) / 15) + 1 = floor(105/15) + 1 = 8  ✓
+
+    If you change input resolution, recompute kernel/stride/padding accordingly and
+    pass them as pool_kernel, pool_stride, pool_padding arguments.
+    """
+    def __init__(self, ch: int = 128, num_heads: int = 4,
+                 pool_size: int = 8,
+                 pool_kernel: tuple = (9, 15),
+                 pool_stride: tuple = (8, 15),
+                 pool_padding: tuple = (1, 0)):
         super(BottleneckCrossAttn, self).__init__()
-        self.pool = nn.AdaptiveAvgPool2d(pool_size)
+
+        # Depthwise strided conv replaces AdaptiveAvgPool2d.
+        # groups=ch → no channel mixing (same as pooling behaviour).
+        # Learnable weights give the model freedom to learn better than avg pooling.
+        self.pool = nn.Conv2d(
+            in_channels  = ch,
+            out_channels = ch,
+            kernel_size  = pool_kernel,
+            stride       = pool_stride,
+            padding      = pool_padding,
+            groups       = ch,
+            bias         = False
+        )
+
         self.to_q = nn.Linear(ch, ch, bias=False)
         self.to_k = nn.Linear(ch, ch, bias=False)
         self.to_v = nn.Linear(ch, ch, bias=False)
@@ -128,6 +165,8 @@ class BottleneckCrossAttn(nn.Module):
         self.gate = nn.Sequential(nn.Linear(ch, ch), nn.Sigmoid())
 
     def _to_tokens(self, feat):
+        # pool: (N, C, H, W) → (N, C, pool_size, pool_size)
+        # flatten+transpose: → (N, pool_size*pool_size, C)
         return self.pool(feat).flatten(2).transpose(1, 2)
 
     def forward(self, x: torch.Tensor, bank: KVBank):
@@ -159,7 +198,10 @@ class DenBlock(nn.Module):
 
     Returns: denoised (N, 3, H, W)
     """
-    def __init__(self, bank_size: int = 10, num_heads: int = 4, pool_size: int = 8):
+    def __init__(self, bank_size: int = 10, num_heads: int = 4, pool_size: int = 8,
+                 pool_kernel: tuple = (9, 15),
+                 pool_stride: tuple = (8, 15),
+                 pool_padding: tuple = (1, 0)):
         super(DenBlock, self).__init__()
         self.chs_lyr0 = 32
         self.chs_lyr1 = 64
@@ -170,7 +212,10 @@ class DenBlock(nn.Module):
         self.downc1 = DownBlock(in_ch=self.chs_lyr1, out_ch=self.chs_lyr2)
         self.kv_attn = BottleneckCrossAttn(ch=self.chs_lyr2,
                                            num_heads=num_heads,
-                                           pool_size=pool_size)
+                                           pool_size=pool_size,
+                                           pool_kernel=pool_kernel,
+                                           pool_stride=pool_stride,
+                                           pool_padding=pool_padding)
         self.upc2 = UpBlock(in_ch=self.chs_lyr2, out_ch=self.chs_lyr1)
         self.upc1 = UpBlock(in_ch=self.chs_lyr1, out_ch=self.chs_lyr0)
         self.outc = OutputCvBlock(in_ch=self.chs_lyr0, out_ch=3)
@@ -205,10 +250,15 @@ class DenBlock(nn.Module):
 
 
 class FastDVDnet(nn.Module):
-    def __init__(self, bank_size: int = 10, num_heads: int = 4, pool_size: int = 8):
+    def __init__(self, bank_size: int = 10, num_heads: int = 4, pool_size: int = 8,
+                 pool_kernel: tuple = (9, 15),
+                 pool_stride: tuple = (8, 15),
+                 pool_padding: tuple = (1, 0)):
         super(FastDVDnet, self).__init__()
         self.num_input_frames = 1
-        self.temp = DenBlock(bank_size=bank_size, num_heads=num_heads, pool_size=pool_size)
+        self.temp = DenBlock(bank_size=bank_size, num_heads=num_heads, pool_size=pool_size,
+                             pool_kernel=pool_kernel, pool_stride=pool_stride,
+                             pool_padding=pool_padding)
         self.reset_params()
 
     @staticmethod
@@ -228,15 +278,25 @@ class FastDVDnet(nn.Module):
 
 
 if __name__ == "__main__":
+    # Sanity check for H=270, W=480 (i.e. 1080/4 x 1920/4)
+    # Bottleneck shape after 2x stride-2: (N, 128, 67, 120)
+    # Pool conv: kernel=(9,15), stride=(8,15), padding=(1,0) → (N, 128, 8, 8)
     bank_size = 10
-    model = FastDVDnet(bank_size=bank_size, num_heads=4, pool_size=8)
+    model = FastDVDnet(
+        bank_size=bank_size,
+        num_heads=4,
+        pool_size=8,
+        pool_kernel=(9, 15),
+        pool_stride=(8, 15),
+        pool_padding=(1, 0)
+    )
     bank  = KVBank(bank_size=bank_size)
     model.eval()
     with torch.no_grad():
         for t in range(5):
-            frame    = torch.randn(1, 3, 96, 96)
-            s_map    = torch.full((1, 1, 96, 96), 0.02)
-            l_map    = torch.rand(1, 1, 96, 96) * 0.5
+            frame    = torch.randn(1, 3, 270, 480)
+            s_map    = torch.full((1, 1, 270, 480), 0.02)
+            l_map    = torch.rand(1, 1, 270, 480) * 0.5
             out = model(frame, s_map, l_map, bank)
             print(f"t={t}  bank_len={len(bank)}  out={out.shape}")
     print("Sanity check passed!")

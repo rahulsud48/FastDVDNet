@@ -78,3 +78,5 @@ result_y_only_v2/
 train_logs1.txt
 logs_y_only/
 logs_y_only_noisy_RGB/
+logs_kv_bank_dwconv_strided/
+traibn_logs.txt
