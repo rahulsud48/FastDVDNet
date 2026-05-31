@@ -80,3 +80,6 @@ logs_y_only/
 logs_y_only_noisy_RGB/
 logs_kv_bank_dwconv_strided/
 traibn_logs.txt
+results_kv_bank_dwconv_strided/
+kv_bank_dwconv_strided_with_gate_skips/
+logs_kv_bank_dwconv_strided_with_gate_skips/
