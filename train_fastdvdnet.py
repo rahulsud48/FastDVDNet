@@ -17,7 +17,7 @@ Noise maps passed to model:
   lambda_shot_map : (N, 1, H, W) per-pixel = luma(h,w) * lam — heteroscedastic
 """
 
-import os
+import os, sys
 import time
 import argparse
 
@@ -27,7 +27,7 @@ import torch.optim as optim
 import torchvision.utils as tutils
 import time as _time
 
-from models import FastDVDnet, KVBank
+from models import FastDVDnet#, KVBank
 from dataset import ValDataset
 from simple_dataloader import train_simple_loader
 from utils import svd_orthogonalization, close_logger, init_logging, normalize_augment, batch_psnr
@@ -179,7 +179,9 @@ def main(**args):
             # sigma_read map: flat scalar — AWGN is spatially uniform
             sigma_read_map = stdn.expand(N, 1, H, W)   # (N, 1, H, W)
 
-            bank     = KVBank(bank_size=args['bank_size'], detach=False)
+            # bank     = KVBank(bank_size=args['bank_size'], detach=False)
+            bank_k = torch.zeros(N,10*64,64).cuda()
+            bank_v = torch.zeros(N,10*64,64).cuda()
             loss     = torch.tensor(0.0).cuda()
             out_train = None
 
@@ -200,9 +202,13 @@ def main(**args):
                 lambda_shot_map = (ftn.mean(dim=1, keepdim=True) *
                                    lam.expand(N, 1, H, W)).clamp(1e-6, 1.0)
 
-                # Forward pass
-                out_t = model(ftn, sigma_read_map, lambda_shot_map, bank)
 
+                input_data = torch.cat((ftn, sigma_read_map, lambda_shot_map), dim = 1)
+                # Forward pass
+                res_t, curr_k, curr_v = model(input_data, bank_k, bank_v)
+                out_t = ftn - res_t
+                bank_k = torch.cat([bank_k[:, 64:, :], curr_k.detach()], dim=1)
+                bank_v = torch.cat([bank_v[:, 64:, :], curr_v.detach()], dim=1)
                 # Loss on central frame: MSE(denoised, clean GT)
                 if t == ctrl_fr_idx:
                     loss      = criterion(out_t, gt_train) / (N * 2)

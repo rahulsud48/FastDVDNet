@@ -3,10 +3,10 @@ FastDVDnet denoising — single-frame + KV bank + dual noise maps.
 """
 import torch
 import torch.nn.functional as F
-from models import KVBank
+# from models import KVBank
 
 
-def temp_denoise(model, noisyframe, sigma_read_map, lambda_shot_map, bank):
+def temp_denoise(model, noisyframe, sigma_read_map, lambda_shot_map, bank_k, bank_v):
     """Handles padding, calls model, strips padding."""
     sh_im      = noisyframe.size()
     expanded_h = sh_im[-2] % 4
@@ -20,14 +20,16 @@ def temp_denoise(model, noisyframe, sigma_read_map, lambda_shot_map, bank):
     noisyframe      = F.pad(noisyframe,       padexp, mode='reflect')
     sigma_read_map  = F.pad(sigma_read_map,   padexp, mode='reflect')
     lambda_shot_map = F.pad(lambda_shot_map,  padexp, mode='reflect')
-
-    out = torch.clamp(model(noisyframe, sigma_read_map, lambda_shot_map, bank), 0., 1.)
+    input_data = torch.cat((noisyframe, sigma_read_map, lambda_shot_map), dim = 1)
+    
+    res, curr_k, curr_v = model(input_data, bank_k, bank_v)
+    out = torch.clamp(noisyframe - res, 0., 1.)
 
     if expanded_h:
         out = out[:, :, :-expanded_h, :]
     if expanded_w:
         out = out[:, :, :, :-expanded_w]
-    return out
+    return out, curr_k, curr_v
 
 
 def denoise_seq_fastdvdnet(seq, noise_std, lambda_shot, temp_psz,
@@ -51,7 +53,9 @@ def denoise_seq_fastdvdnet(seq, noise_std, lambda_shot, temp_psz,
     # sigma_read map: flat scalar broadcast — AWGN is spatially uniform
     sigma_read_map = noise_std.expand((1, 1, H, W))
 
-    bank = KVBank(bank_size=bank_size)
+    # bank = KVBank(bank_size=bank_size)
+    bank_k = torch.zeros(1,10*64,64).cuda()
+    bank_v = torch.zeros(1,10*64,64).cuda()
 
     for fridx in range(numframes):
         frame_t = seq[fridx].unsqueeze(0)   # (1, C, H, W)
@@ -61,10 +65,13 @@ def denoise_seq_fastdvdnet(seq, noise_std, lambda_shot, temp_psz,
         lambda_shot_map = (frame_t.mean(dim=1, keepdim=True) * lambda_shot)\
                           .clamp(1e-6, 1.0)
 
-        denframes[fridx] = temp_denoise(
+        out, curr_k, curr_v = temp_denoise(
             model_temporal, frame_t,
-            sigma_read_map, lambda_shot_map, bank
+            sigma_read_map, lambda_shot_map, bank_k, bank_v
         )
+        bank_k = torch.cat([bank_k[:, 64:, :], curr_k], dim=1)
+        bank_v = torch.cat([bank_v[:, 64:, :], curr_v], dim=1)
+        denframes[fridx] = out
 
     torch.cuda.empty_cache()
     return denframes

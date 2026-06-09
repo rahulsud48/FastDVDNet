@@ -8,23 +8,36 @@ Changes from uploaded version:
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-
-class CvBlock(nn.Module):
-    """(Conv2d 3x3 => BN => ReLU) x 2"""
-    def __init__(self, in_ch, out_ch):
-        super(CvBlock, self).__init__()
-        self.convblock = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_ch),
+class learningBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(learningBlock, self).__init__()
+        self.middle_channels = out_channels
+        self.learning_block = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size = 3, padding = 1, bias = False),
+            nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True)
         )
 
     def forward(self, x):
-        return self.convblock(x)
+        return self.learning_block(x)
+
+
+class UpBlock(nn.Module):
+    """CvBlock => ConvTranspose2d x2"""
+    def __init__(self, in_channels, out_channels):
+        super(UpBlock, self).__init__()
+        self.upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+
+        self.Upscale_Block = nn.Sequential(
+            learningBlock(in_channels, out_channels)
+        )
+
+    def forward(self, x):
+        return self.upsample(self.Upscale_Block(x))
+
+
 
 
 class InputCvBlock(nn.Module):
@@ -32,116 +45,117 @@ class InputCvBlock(nn.Module):
     First encoder block.
     Accepts 5 channels: RGB(3) + sigma_read map(1) + lambda_shot map(1).
     """
-    def __init__(self, out_ch):
+    def __init__(self, out_channels):
         super(InputCvBlock, self).__init__()
-        self.interm_ch = 30
+        # self.interm_ch = 30
         # 3 (RGB) + 1 (sigma_read) + 1 (lambda_shot) = 5 input channels
-        self.convblock = nn.Sequential(
-            nn.Conv2d(5, self.interm_ch, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(self.interm_ch),
+        self.Input_Cv_Block = nn.Sequential(
+            nn.Conv2d(5, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True),
-            nn.Conv2d(self.interm_ch, out_ch, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True)
         )
 
     def forward(self, x):
-        return self.convblock(x)
+        return self.Input_Cv_Block(x)
 
 
 class DownBlock(nn.Module):
     """Stride-2 Conv2d => BN => ReLU => CvBlock"""
-    def __init__(self, in_ch, out_ch):
+    def __init__(self, in_channels, out_channels):
         super(DownBlock, self).__init__()
         self.convblock = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(out_ch),
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True),
-            CvBlock(out_ch, out_ch)
+            learningBlock(out_channels, out_channels)
         )
 
     def forward(self, x):
         return self.convblock(x)
 
-
-class UpBlock(nn.Module):
-    """CvBlock => ConvTranspose2d x2"""
-    def __init__(self, in_ch, out_ch):
-        super(UpBlock, self).__init__()
-        self.cvblock  = CvBlock(in_ch, in_ch)
-        self.upsample = nn.ConvTranspose2d(in_ch, out_ch, kernel_size=2, stride=2, bias=False)
-
-    def forward(self, x):
-        return self.upsample(self.cvblock(x))
 
 
 class OutputCvBlock(nn.Module):
     """Conv2d 3x3 => BN => ReLU => Conv2d 3x3"""
-    def __init__(self, in_ch, out_ch):
+    def __init__(self, in_channels, out_channels):
         super(OutputCvBlock, self).__init__()
-        self.convblock = nn.Sequential(
-            nn.Conv2d(in_ch, in_ch, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(in_ch),
+        self.Output_Cv_Block = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(in_channels),
             nn.ReLU(inplace=True),
-            nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, bias=False)
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False)
         )
 
     def forward(self, x):
-        return self.convblock(x)
+        return self.Output_Cv_Block(x)
 
 
-class KVBank:
-    def __init__(self, bank_size: int = 10, detach: bool = True):
-        self.bank_size = bank_size
-        self.detach    = detach
-        self._keys:   list = []
-        self._values: list = []
+# class KVBank:
+#     def __init__(self, bank_size: int = 10, detach: bool = True):
+#         self.bank_size = bank_size
+#         self.detach    = detach
+#         self._keys:   list = []
+#         self._values: list = []
 
-    def reset(self):
-        self._keys.clear()
-        self._values.clear()
+#     def reset(self):
+#         self._keys.clear()
+#         self._values.clear()
 
-    def push(self, k: torch.Tensor, v: torch.Tensor):
-        self._keys.append(k.detach() if self.detach else k)
-        self._values.append(v.detach() if self.detach else v)
-        if len(self._keys) > self.bank_size:
-            self._keys.pop(0)
-            self._values.pop(0)
+#     def push(self, k: torch.Tensor, v: torch.Tensor):
+#         self._keys.append(k.detach() if self.detach else k)
+#         self._values.append(v.detach() if self.detach else v)
+#         if len(self._keys) > self.bank_size:
+#             self._keys.pop(0)
+#             self._values.pop(0)
 
-    def get(self):
-        if not self._keys:
-            return None, None
-        return torch.cat(self._keys, dim=1), torch.cat(self._values, dim=1)
+#     def get(self):
+#         if not self._keys:
+#             return None, None
+#         return torch.cat(self._keys, dim=1), torch.cat(self._values, dim=1)
 
-    def __len__(self):
-        return len(self._keys)
+#     def __len__(self):
+#         return len(self._keys)
 
 
 class BottleneckCrossAttn(nn.Module):
     def __init__(self, ch: int = 128, num_heads: int = 4, pool_size: int = 8):
         super(BottleneckCrossAttn, self).__init__()
         self.pool = nn.AdaptiveAvgPool2d(pool_size)
+        # self.pool = nn.Conv2d(
+        #     in_channels=ch,
+        #     out_channels=ch,
+        #     kernel_size = (46,60),
+        #     stride = (32,60),
+        #     padding = (0,0),
+        #     groups = ch,
+        #     bias = False
+        # )
+
         self.to_q = nn.Linear(ch, ch, bias=False)
         self.to_k = nn.Linear(ch, ch, bias=False)
         self.to_v = nn.Linear(ch, ch, bias=False)
-        self.attn = nn.MultiheadAttention(ch, num_heads, batch_first=True)
+        # self.attn = nn.MultiheadAttention(ch, num_heads, batch_first=True)
         self.gate = nn.Sequential(nn.Linear(ch, ch), nn.Sigmoid())
 
     def _to_tokens(self, feat):
         return self.pool(feat).flatten(2).transpose(1, 2)
 
-    def forward(self, x: torch.Tensor, bank: KVBank):
+    def forward(self, x: torch.Tensor, bank_k: torch.Tensor, bank_v: torch.Tensor):
         N, C, H, W = x.shape
         tokens = self._to_tokens(x)
         q_cur  = self.to_q(tokens)
         k_cur  = self.to_k(tokens)
         v_cur  = self.to_v(tokens)
 
-        bank_k, bank_v = bank.get()
-        if bank_k is None:
-            return x, k_cur, v_cur
+        # bank_k, bank_v = bank.get()
+        # if bank_k is None:
+        #     return x, k_cur, v_cur
 
-        attn_out, _ = self.attn(q_cur, bank_k, bank_v)
+        # attn_out, _ = self.attn(q_cur, bank_k, bank_v)
+        qkT = torch.matmul(q_cur, bank_k.transpose(-2,-1))/8.0
+        attn_map = F.softmax(qkT, dim=-1)
+        attn_out = torch.matmul(attn_map, bank_v)
+
         gate  = self.gate(attn_out.mean(dim=1)).view(N, C, 1, 1)
         x_out = x * gate + x
         return x_out, k_cur, v_cur
@@ -161,47 +175,43 @@ class DenBlock(nn.Module):
     """
     def __init__(self, bank_size: int = 10, num_heads: int = 4, pool_size: int = 8):
         super(DenBlock, self).__init__()
-        self.chs_lyr0 = 32
-        self.chs_lyr1 = 64
-        self.chs_lyr2 = 128
+        self.channels_layer0 = 32
+        self.channels_layer1 = 32
+        self.channels_layer2 = 64
 
-        self.inc    = InputCvBlock(out_ch=self.chs_lyr0)   # 5ch input
-        self.downc0 = DownBlock(in_ch=self.chs_lyr0, out_ch=self.chs_lyr1)
-        self.downc1 = DownBlock(in_ch=self.chs_lyr1, out_ch=self.chs_lyr2)
-        self.kv_attn = BottleneckCrossAttn(ch=self.chs_lyr2,
+        self.input_conv_block    = InputCvBlock(out_channels=self.channels_layer0)   # 5ch input
+        self.downsample0 = DownBlock(in_channels=self.channels_layer0, out_channels=self.channels_layer1)
+        self.downsample1 = DownBlock(in_channels=self.channels_layer1, out_channels=self.channels_layer2)
+        self.kv_attn = BottleneckCrossAttn(ch=self.channels_layer2,
                                            num_heads=num_heads,
                                            pool_size=pool_size)
-        self.upc2 = UpBlock(in_ch=self.chs_lyr2, out_ch=self.chs_lyr1)
-        self.upc1 = UpBlock(in_ch=self.chs_lyr1, out_ch=self.chs_lyr0)
-        self.outc = OutputCvBlock(in_ch=self.chs_lyr0, out_ch=3)
-        self.reset_params()
+        self.upsample2 = UpBlock(in_channels=self.channels_layer2, out_channels=self.channels_layer1)
+        self.upsample1 = UpBlock(in_channels=self.channels_layer1, out_channels=self.channels_layer0)
+        self.output_conv_block = OutputCvBlock(in_channels=self.channels_layer0, out_channels=3)
+        # self.reset_params()
 
-    @staticmethod
-    def weight_init(m):
-        if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
-            nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+    # @staticmethod
+    # def weight_init(m):
+    #     if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
+    #         nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
 
-    def reset_params(self):
-        for _, m in enumerate(self.modules()):
-            self.weight_init(m)
+    # def reset_params(self):
+    #     for _, m in enumerate(self.modules()):
+    #         self.weight_init(m)
 
-    def forward(self, frame_t: torch.Tensor,
-                      sigma_read_map: torch.Tensor,
-                      lambda_shot_map: torch.Tensor,
-                      bank: KVBank):
+    def forward(self, x, bank_k, bank_v):
         # Concat: RGB + sigma_read + lambda_shot = 5 channels
-        x0 = self.inc(torch.cat((frame_t, sigma_read_map, lambda_shot_map), dim=1))
-        x1 = self.downc0(x0)
-        x2 = self.downc1(x1)
+        x0 = self.input_conv_block(x)
+        x1 = self.downsample0(x0)
+        x2 = self.downsample1(x1)
 
-        x2, k_cur, v_cur = self.kv_attn(x2, bank)
-        bank.push(k_cur, v_cur)
+        x2, k_cur, v_cur = self.kv_attn(x2, bank_k, bank_v)
 
-        x2 = self.upc2(x2)
-        x1 = self.upc1(x1 + x2)
-        x  = self.outc(x0 + x1)
+        x2 = self.upsample2(x2)
+        x1 = self.upsample1(x1 + x2)
+        x  = self.output_conv_block(x0 + x1)
 
-        return frame_t - x
+        return x, k_cur, v_cur
 
 
 class FastDVDnet(nn.Module):
@@ -209,34 +219,36 @@ class FastDVDnet(nn.Module):
         super(FastDVDnet, self).__init__()
         self.num_input_frames = 1
         self.temp = DenBlock(bank_size=bank_size, num_heads=num_heads, pool_size=pool_size)
-        self.reset_params()
+        # self.reset_params()
 
-    @staticmethod
-    def weight_init(m):
-        if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
-            nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+    # @staticmethod
+    # def weight_init(m):
+    #     if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
+    #         nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
 
-    def reset_params(self):
-        for _, m in enumerate(self.modules()):
-            self.weight_init(m)
+    # def reset_params(self):
+    #     for _, m in enumerate(self.modules()):
+    #         self.weight_init(m)
 
-    def forward(self, frame_t: torch.Tensor,
-                      sigma_read_map: torch.Tensor,
-                      lambda_shot_map: torch.Tensor,
-                      bank: KVBank):
-        return self.temp(frame_t, sigma_read_map, lambda_shot_map, bank)
+    def forward(self, input_data, bank_k, bank_v):
+        return self.temp(input_data, bank_k, bank_v)
 
 
 if __name__ == "__main__":
     bank_size = 10
-    model = FastDVDnet(bank_size=bank_size, num_heads=4, pool_size=8)
-    bank  = KVBank(bank_size=bank_size)
+    model = FastDVDnet(bank_size=bank_size, num_heads=1, pool_size=8)
+    bank_k = torch.randn(1,10*64,64)
+    bank_v = torch.randn(1,10*64,64)
+    # bank  = KVBank(bank_size=bank_size)
     model.eval()
     with torch.no_grad():
-        for t in range(5):
-            frame    = torch.randn(1, 3, 96, 96)
-            s_map    = torch.full((1, 1, 96, 96), 0.02)
-            l_map    = torch.rand(1, 1, 96, 96) * 0.5
-            out = model(frame, s_map, l_map, bank)
-            print(f"t={t}  bank_len={len(bank)}  out={out.shape}")
+        for t in range(12):
+            frame    = torch.randn(1, 3, 1080, 1920)
+            s_map    = torch.full((1, 1,1080, 1920), 0.02)
+            l_map    = torch.rand(1, 1, 1080, 1920) * 0.5
+            input_data = torch.cat((frame, s_map, l_map), dim = 1)
+            denoised, curr_k, curr_v = model(input_data, bank_k, bank_v)
+            bank_k = torch.cat([bank_k[:, 64:, :], curr_k], dim=1)
+            bank_v = torch.cat([bank_v[:, 64:, :], curr_v], dim=1)
+            print(f"t={t}  bank_k={bank_k.shape}  out={denoised.shape}")
     print("Sanity check passed!")
