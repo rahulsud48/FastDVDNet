@@ -118,7 +118,7 @@ def main(**args):
     )
 
     num_minibatches = int(args['max_number_patches'] // args['batch_size'])
-    ctrl_fr_idx     = (args['temp_patch_size'] - 1) // 2
+    # ctrl_fr_idx     = (args['temp_patch_size'] - 1) // 2
     print("\t# of training samples: %d\n" % int(args['max_number_patches']))
 
     writer, logger = init_logging(args)
@@ -162,7 +162,8 @@ def main(**args):
             model.train()
             optimizer.zero_grad()
 
-            img_train, gt_train = normalize_augment(data['data'], ctrl_fr_idx)
+            # img_train, gt_train = normalize_augment(data['data'], ctrl_fr_idx)
+            img_train, gt_train = normalize_augment(data['data'])
             N, _, H, W = img_train.size()
             num_frames = args['temp_patch_size']
 
@@ -184,10 +185,9 @@ def main(**args):
             bank_v = torch.zeros(N,10*64,64).cuda()
             loss     = torch.tensor(0.0).cuda()
             out_train = None
-
             for t in range(num_frames):
                 ft = img_train[:, 3*t:3*t+3, :, :].cuda(non_blocking=True)
-
+                gt_t = gt_train[:, 3*t:3*t+3, :, :].cuda(non_blocking=True)
                 # Shot noise (Poisson) — applied first (optical before electronic)
                 photons = (ft * 255.0 / lam.expand_as(ft)).clamp(1e-6)
                 ft_shot = (torch.poisson(photons) * lam.expand_as(ft) / 255.0).clamp(0., 1.)
@@ -210,10 +210,9 @@ def main(**args):
                 bank_k = torch.cat([bank_k[:, 64:, :], curr_k.detach()], dim=1)
                 bank_v = torch.cat([bank_v[:, 64:, :], curr_v.detach()], dim=1)
                 # Loss on central frame: MSE(denoised, clean GT)
-                if t == ctrl_fr_idx:
-                    loss      = criterion(out_t, gt_train) / (N * 2)
-                    out_train = out_t
-
+                # if t == ctrl_fr_idx:
+                loss      = criterion(out_t, gt_t) / (N * 2)
+                out_train = out_t
             loss.backward()
             optimizer.step()
 
@@ -294,7 +293,7 @@ if __name__ == "__main__":
 
     # Patch / sequence
     parser.add_argument("--patch_size", "--p",       type=int, default=96)
-    parser.add_argument("--temp_patch_size", "--tp", type=int, default=5)
+    parser.add_argument("--temp_patch_size", "--tp", type=int, default=11)
     parser.add_argument("--max_number_patches","--m",type=int, default=256000)
 
     # KV bank

@@ -16,7 +16,7 @@ import torch.nn as nn
 
 IMAGETYPES = ('*.bmp', '*.png', '*.jpg', '*.jpeg', '*.tif') # Supported image types
 
-def normalize_augment(datain, ctrl_fr_idx):
+def normalize_augment(datain, ctrl_fr_idx = None):
 	'''Normalizes and augments an input patch of dim [N, num_frames, C. H, W] in [0., 255.] to \
 		[N, num_frames*C. H, W] in  [0., 1.]. It also returns the central frame of the temporal \
 		patch as a ground truth.
@@ -61,8 +61,8 @@ def normalize_augment(datain, ctrl_fr_idx):
 	img_train = transform(img_train)
 
 	# extract ground truth (central frame)
-	gt_train = img_train[:, 3*ctrl_fr_idx:3*ctrl_fr_idx+3, :, :]
-	return img_train, gt_train
+	# gt_train = img_train[:, 3*ctrl_fr_idx:3*ctrl_fr_idx+3, :, :]
+	return img_train, img_train#, gt_train
 
 def init_logging(argdict):
 	"""Initilizes the logging and the SummaryWriter modules
