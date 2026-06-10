@@ -84,3 +84,9 @@ results_kv_bank_dwconv_strided/
 kv_bank_dwconv_strided_with_gate_skips/
 logs_kv_bank_dwconv_strided_with_gate_skips/
 logs_actual_noise_no_skips/
+trains_logs.txt
+data_fullhd/
+results_test/
+.gitignore
+logs_test_v3/
+logs_test_v2/

@@ -1,1 +1,1 @@
-python make_video.py --results results_kvbank_actual_noise --fps 5 --tag s10_l10
+python make_video.py --results results_test --fps 5 --tag s10_l10

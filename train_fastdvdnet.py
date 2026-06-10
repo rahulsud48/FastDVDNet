@@ -213,13 +213,13 @@ def main(**args):
                 # if t == ctrl_fr_idx:
                 loss      = criterion(out_t, gt_t) / (N * 2)
                 out_train = out_t
-            loss.backward()
+                loss.backward()
             optimizer.step()
 
             if training_params['step'] % args['save_every'] == 0:
                 if not training_params['no_orthog']:
                     model.apply(svd_orthogonalization)
-                log_train_psnr(out_train, gt_train, loss,
+                log_train_psnr(out_train, gt_t, loss,
                                writer, epoch, i, num_minibatches, training_params)
 
             training_params['step'] += 1
