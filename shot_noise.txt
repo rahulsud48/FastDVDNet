@@ -1,0 +1,24 @@
+Shot noise is the physical noise that comes from light itself being quantized into photons. Let me explain the concept, then map it to your code.
+The physics. A camera sensor counts photons. Photon arrival is a random process — even from a perfectly steady light source, the number of photons hitting a pixel in a fixed time fluctuates. This fluctuation follows a Poisson distribution. The defining property of Poisson: the variance equals the mean. If a pixel receives on average λ photons, the actual count varies with variance λ, so standard deviation √λ.
+The crucial consequence: noise scales with brightness. Bright pixels (high λ) have larger absolute noise (√λ grows), but smaller relative noise (√λ/λ = 1/√λ shrinks). Dark regions look noisier proportionally — which is why shadows are where you see the grain. This is fundamentally different from read noise (AWGN), which is a fixed-width Gaussian added everywhere regardless of brightness.
+This brightness-dependence is called heteroscedastic noise — the noise level varies per pixel with the signal. Read noise is homoscedastic — same everywhere.
+Why model it. Real sensor noise is Poisson (shot) + Gaussian (read), often called the Poisson-Gaussian model. Training a denoiser on pure AWGN teaches it to remove uniform-width noise, but real footage has brightness-dependent noise. If your ISP target is real sensor data, you want the network to learn that dark regions need more smoothing than bright ones. That's the whole point of adding shot noise to your pipeline.
+Now your code. In train_fastdvdnet.py:
+pythonphotons = (ft * 255.0 / lam.expand_as(ft)).clamp(1e-6)
+ft_shot = (torch.poisson(photons) * lam.expand_as(ft) / 255.0).clamp(0., 1.)
+Walk through it:
+
+ft is the clean image in [0,1]. ft * 255 puts it in [0,255] (pixel-value space).
+Dividing by lam converts intensity into a photon count: photons = intensity / lam. Here lam acts as "how many intensity units per photon" — a gain factor. Small lam → many photons → less relative noise. Large lam → few photons → more noise. So lam is your noise-strength knob.
+torch.poisson(photons) draws a random count from a Poisson distribution with that mean. This is the actual shot-noise simulation — replace the deterministic mean with a random Poisson sample.
+Multiply back by lam and /255 to return to [0,1] image space.
+
+So the pipeline converts image → photon counts → samples Poisson → converts back. The result ft_shot is the clean image corrupted by signal-dependent shot noise.
+Then read noise is added on top:
+pythonnoise = torch.normal(0, stdn)      # Gaussian, fixed width
+ftn   = (ft_shot + noise).clamp(0,1)
+Order matters and is physically correct: shot noise first (it happens at the photodiode, in the optical domain), read noise after (it's added by the readout electronics downstream). Your comment "optical before electronic" captures this.
+The lambda_shot_map. You also build:
+pythonlambda_shot_map = (ftn.mean(dim=1, keepdim=True) * lam).clamp(1e-6, 1.0)
+This is the side information you feed the network so it knows how much shot noise to expect at each pixel. Since shot-noise strength depends on local brightness, luma × lam is a per-pixel estimate of the noise level. The network reads this map and adapts its denoising spatially — smoothing dark/noisy regions more. That's the heteroscedastic signal made explicit to the model, parallel to how sigma_read_map tells it the (uniform) read-noise level.
+One subtlety worth noting: lam in your code is the inverse of physical λ — large lam means fewer photons and more noise. It's a scaling convention, not the literal Poisson mean. As long as train and test use the same convention (they do — both divide by lam the same way), it's consistent. Just don't confuse your lam with the textbook Poisson λ; they're reciprocally related.

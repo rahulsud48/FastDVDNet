@@ -111,10 +111,12 @@ def main(**args):
         batch_size=args['batch_size'],
         file_root=args['trainset_dir'],
         sequence_length=args['temp_patch_size'],
-        crop_size=args['patch_size'],
+        crop_h=args['patch_h'],
+        crop_w=args['patch_w'],
         epoch_size=args['max_number_patches'],
         random_shuffle=True,
-        temp_stride=3,
+        temp_stride=args['temp_stride'],
+        num_workers=args['num_workers'],         # 0 if shm-limited
     )
 
     num_minibatches = int(args['max_number_patches'] // args['batch_size'])
@@ -129,6 +131,7 @@ def main(**args):
         bank_size=args['bank_size'],
         num_heads=args['num_heads'],
         pool_size=args['pool_size'],
+        train_mode = True
     )
     print("########### Model Architecture ###############")
     print(model)
@@ -292,9 +295,13 @@ if __name__ == "__main__":
                         help="Poisson lambda for validation in [0,255]")
 
     # Patch / sequence
-    parser.add_argument("--patch_size", "--p",       type=int, default=96)
-    parser.add_argument("--temp_patch_size", "--tp", type=int, default=11)
+    # parser.add_argument("--patch_size", "--p",       type=int, default=96)
+    parser.add_argument("--patch_h", type=int, default=96)
+    parser.add_argument("--patch_w", type=int, default=96)
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--temp_patch_size", "--tp", type=int, default=20)
     parser.add_argument("--max_number_patches","--m",type=int, default=256000)
+    parser.add_argument("--temp_stride",type=int, default=3)
 
     # KV bank
     parser.add_argument("--bank_size",  type=int, default=10)

@@ -9,7 +9,6 @@ Changes from uploaded version:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import sys
 
 class learningBlock(nn.Module):
     def __init__(self, in_channels, out_channels):
@@ -117,38 +116,12 @@ class OutputCvBlock(nn.Module):
 #     def __len__(self):
 #         return len(self._keys)
 
-class AdaptiveAvgPool(nn.Module):
-    def __init__(self, train_mode = True):
-        super().__init__()
-        # Initialize with training dimensions by default (96x96 -> 8x8)
-        if train_mode:
-            self.pool = nn.AvgPool2d(kernel_size=3, stride=3)
-        else:
-            self.pool = nn.AvgPool2d(kernel_size=(31, 53), stride=(34, 61))
-        
-    # def train(self, mode=True):
-    #     """Automatically adjusts pooling parameters when switching modes."""
-    #     super().train(mode)
-    #     if mode:
-    #         # Training mode: expects 96x96 patch input
-    #         self.pool = nn.AvgPool2d(kernel_size=12, stride=12)
-    #     else:
-    #         # Inference mode: expects 270x480 input for the custom compiler
-    #         self.pool = nn.AvgPool2d(kernel_size=(31, 53), stride=(34, 61))
-    #     return self
-
-    def forward(self, x):
-        # Your convolutional layers would go here
-        x = self.pool(x)
-        return x
-
 
 class BottleneckCrossAttn(nn.Module):
-    def __init__(self, ch: int = 128, num_heads: int = 4, pool_size: int = 8, train_mode = True):
+    def __init__(self, ch: int = 128, num_heads: int = 4, pool_size: int = 8):
         super(BottleneckCrossAttn, self).__init__()
         # self.pool = nn.AdaptiveAvgPool2d(pool_size)
-        # self.pool = nn.AvgPool2d(kernel_size=12, stride=12)
-        self.pool = AdaptiveAvgPool(train_mode)
+        self.pool = nn.AvgPool2d(kernel_size=(31, 53), stride=(34, 61))
         # self.pool = nn.Conv2d(
         #     in_channels=ch,
         #     out_channels=ch,
@@ -201,7 +174,7 @@ class DenBlock(nn.Module):
 
     Returns: denoised (N, 3, H, W)
     """
-    def __init__(self, bank_size: int = 10, num_heads: int = 4, pool_size: int = 8, train_mode = True):
+    def __init__(self, bank_size: int = 10, num_heads: int = 4, pool_size: int = 8):
         super(DenBlock, self).__init__()
         self.channels_layer0 = 32
         self.channels_layer1 = 32
@@ -212,7 +185,7 @@ class DenBlock(nn.Module):
         self.downsample1 = DownBlock(in_channels=self.channels_layer1, out_channels=self.channels_layer2)
         self.kv_attn = BottleneckCrossAttn(ch=self.channels_layer2,
                                            num_heads=num_heads,
-                                           pool_size=pool_size, train_mode=train_mode)
+                                           pool_size=pool_size)
         self.upsample2 = UpBlock(in_channels=self.channels_layer2, out_channels=self.channels_layer1)
         self.upsample1 = UpBlock(in_channels=self.channels_layer1, out_channels=self.channels_layer0)
         self.output_conv_block = OutputCvBlock(in_channels=self.channels_layer0, out_channels=3)
@@ -243,10 +216,10 @@ class DenBlock(nn.Module):
 
 
 class FastDVDnet(nn.Module):
-    def __init__(self, bank_size: int = 10, num_heads: int = 4, pool_size: int = 8, train_mode = True):
+    def __init__(self, bank_size: int = 10, num_heads: int = 4, pool_size: int = 8):
         super(FastDVDnet, self).__init__()
         self.num_input_frames = 1
-        self.temp = DenBlock(bank_size=bank_size, num_heads=num_heads, pool_size=pool_size, train_mode = train_mode)
+        self.temp = DenBlock(bank_size=bank_size, num_heads=num_heads, pool_size=pool_size)
         # self.reset_params()
 
     # @staticmethod
@@ -264,20 +237,16 @@ class FastDVDnet(nn.Module):
 
 if __name__ == "__main__":
     bank_size = 10
-    model = FastDVDnet(bank_size=bank_size, num_heads=1, pool_size=8, train_mode=True)
+    model = FastDVDnet(bank_size=bank_size, num_heads=1, pool_size=8)
     bank_k = torch.randn(1,10*64,64)
     bank_v = torch.randn(1,10*64,64)
     # bank  = KVBank(bank_size=bank_size)
     model.eval()
-    # H = 1080
-    # W = 1920
-    H = 96
-    W = 96
     with torch.no_grad():
         for t in range(12):
-            frame    = torch.randn(1, 3, H, W)
-            s_map    = torch.full((1, 1, H, W), 0.02)
-            l_map    = torch.rand(1, 1, H, W) * 0.5
+            frame    = torch.randn(1, 3, 1080, 1920)
+            s_map    = torch.full((1, 1,1080, 1920), 0.02)
+            l_map    = torch.rand(1, 1, 1080, 1920) * 0.5
             input_data = torch.cat((frame, s_map, l_map), dim = 1)
             denoised, curr_k, curr_v = model(input_data, bank_k, bank_v)
             bank_k = torch.cat([bank_k[:, 64:, :], curr_k], dim=1)

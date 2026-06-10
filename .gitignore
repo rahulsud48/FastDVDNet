@@ -90,3 +90,4 @@ results_test/
 .gitignore
 logs_test_v3/
 logs_test_v2/
+logs_kvbank_32_32_64/

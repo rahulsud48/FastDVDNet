@@ -110,6 +110,7 @@ def test_fastdvdnet(**args):
         bank_size=args['bank_size'],
         num_heads=args['num_heads'],
         pool_size=args['pool_size'],
+        train_mode = False
     )
     state_dict = torch.load(args['model_file'], map_location=device)
     if args['cuda']:

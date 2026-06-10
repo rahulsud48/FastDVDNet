@@ -7,13 +7,6 @@ from torch.utils.data import Dataset, DataLoader
 
 IMG_EXTS = ("*.png", "*.jpg", "*.jpeg", "*.bmp")
 
-# CHANGED_TO: fixed full-HD canvas. Production ISP inference is locked at
-# 1080x1920 full-frame, and the bottleneck pooling conv has a static kernel
-# whose output token grid depends on input size — so train resolution must
-# match inference resolution exactly. Larger frames are random-cropped to
-# this size; smaller frames are reflect-padded up to it.
-TARGET_H, TARGET_W = 1080, 1920
-
 
 def _list_frames(seq_dir):
     frames = []
@@ -23,14 +16,20 @@ def _list_frames(seq_dir):
 
 
 class SimpleVideoDataset(Dataset):
-    # CHANGED_TO: defaults updated for the full-scene scheme — long scenes of
-    # consecutive frames (temp_stride=1). crop_size kept in the signature for
-    # backward compatibility but is no longer used; the spatial size is fixed
-    # to (TARGET_H, TARGET_W) via crop-or-pad below.
-    def __init__(self, file_root, sequence_length=12, crop_size=None,
+    # CHANGED_TO: spatial size is now parameterized via crop_h x crop_w instead
+    # of a hardcoded full-HD canvas. Pass crop_h=crop_w=96 for fast patch
+    # training, or crop_h=1080, crop_w=1920 for full-frame training. Two
+    # independent dims (not a single square int) so non-square full-HD is
+    # expressible. Frames larger than the target are randomly cropped; frames
+    # smaller are reflect/replicate padded. The crop offset and pad are decided
+    # ONCE per scene and applied to all frames so the temporal stack stays
+    # spatially aligned.
+    def __init__(self, file_root, sequence_length=20, crop_h=96, crop_w=96,
                  epoch_size=256000, temp_stride=1):
         self.file_root = file_root
         self.sequence_length = sequence_length
+        self.crop_h = crop_h
+        self.crop_w = crop_w
         self.epoch_size = epoch_size
         self.temp_stride = temp_stride
 
@@ -42,8 +41,6 @@ class SimpleVideoDataset(Dataset):
         self.sequences = []
 
         # CHANGED_TO: forward-window sampling (was symmetric-around-center).
-        # The new scheme processes a window starting at `start` going forward
-        # for sequence_length frames; the temporal-length filter is unchanged.
         for seq_dir in self.seq_dirs:
             frames = _list_frames(seq_dir)
             min_needed = 1 + (sequence_length - 1) * temp_stride
@@ -62,28 +59,26 @@ class SimpleVideoDataset(Dataset):
     def __len__(self):
         return self.epoch_size
 
-    # CHANGED_TO: new helper. Forces every frame in a scene onto the fixed
-    # (TARGET_H, TARGET_W) canvas. Crop offset (for larger frames) and pad
-    # amount (for smaller frames) are decided ONCE per scene and applied
-    # identically to all frames so the temporal stack stays spatially aligned.
+    # CHANGED_TO: generalized crop-or-pad to (crop_h, crop_w) instead of a
+    # fixed 1080x1920 canvas. Single random crop offset per scene; reflect
+    # pad when the deficit is smaller than the dimension, else replicate.
     def _fit_to_canvas(self, imgs):
+        target_h, target_w = self.crop_h, self.crop_w
         h, w, _ = imgs[0].shape
 
-        # Crop if larger than target (single random offset for the scene)
-        if h > TARGET_H:
-            top = random.randint(0, h - TARGET_H)
-            imgs = [im[top:top + TARGET_H, :, :] for im in imgs]
-            h = TARGET_H
-        if w > TARGET_W:
-            left = random.randint(0, w - TARGET_W)
-            imgs = [im[:, left:left + TARGET_W, :] for im in imgs]
-            w = TARGET_W
+        # Crop if larger than target (single random offset, same for all frames)
+        if h > target_h:
+            top = random.randint(0, h - target_h)
+            imgs = [im[top:top + target_h, :, :] for im in imgs]
+            h = target_h
+        if w > target_w:
+            left = random.randint(0, w - target_w)
+            imgs = [im[:, left:left + target_w, :] for im in imgs]
+            w = target_w
 
-        # Pad if smaller than target. Reflect when the deficit is smaller
-        # than the dimension (otherwise reflection would wrap past the edge);
-        # fall back to replicate for large deficits.
-        pad_b = max(0, TARGET_H - h)
-        pad_r = max(0, TARGET_W - w)
+        # Pad if smaller than target
+        pad_b = max(0, target_h - h)
+        pad_r = max(0, target_w - w)
         if pad_b or pad_r:
             use_reflect = (pad_b < h) and (pad_r < w)
             border = cv2.BORDER_REFLECT_101 if use_reflect else cv2.BORDER_REPLICATE
@@ -106,8 +101,7 @@ class SimpleVideoDataset(Dataset):
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             imgs.append(img)
 
-        # CHANGED_TO: fixed-canvas crop-or-pad replaces the old fixed
-        # random crop to crop_size.
+        # CHANGED_TO: parameterized crop-or-pad to (crop_h, crop_w).
         imgs = self._fit_to_canvas(imgs)
 
         # [F, H, W, C] -> [F, C, H, W], float32
@@ -119,23 +113,24 @@ class SimpleVideoDataset(Dataset):
         return {"data": arr}
 
 
-def train_simple_loader(batch_size, file_root, sequence_length, crop_size=None,
-                        epoch_size=256000, random_shuffle=True, temp_stride=1):
-    # CHANGED_TO: temp_stride default 1; crop_size optional/unused (fixed canvas).
-    # num_workers kept low: each sample is sequence_length x 3 x 1080 x 1920
-    # fp32 (~hundreds of MB), so high worker counts can blow up host RAM.
+def train_simple_loader(batch_size, file_root, sequence_length,
+                        crop_h=96, crop_w=96, epoch_size=256000,
+                        random_shuffle=True, temp_stride=1, num_workers=2):
+    # CHANGED_TO: crop_h/crop_w replace the single crop_size; num_workers
+    # exposed (set 0 if shared-memory limited). temp_stride default 1.
     ds = SimpleVideoDataset(
         file_root=file_root,
         sequence_length=sequence_length,
-        crop_size=crop_size,
+        crop_h=crop_h,
+        crop_w=crop_w,
         epoch_size=epoch_size,
-        temp_stride=temp_stride
+        temp_stride=temp_stride,
     )
     return DataLoader(
         ds,
         batch_size=batch_size,
         shuffle=random_shuffle,
-        num_workers=0,
-        pin_memory=True,
-        drop_last=True
+        num_workers=num_workers,
+        pin_memory=(num_workers > 0),
+        drop_last=True,
     )
