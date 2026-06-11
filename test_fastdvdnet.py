@@ -140,7 +140,8 @@ def test_fastdvdnet(**args):
             seq, _, _ = open_sequence(seq_dir, args['gray'],
                                       expand_if_needed=False,
                                       max_num_fr=args['max_num_fr_per_seq'])
-            seq    = torch.from_numpy(seq).to(device)
+            # seq    = torch.from_numpy(seq).to(device)
+            seq = torch.from_numpy(seq)        # keep on CPU
             load_t = time.time() - seq_start
 
             # Reproducible noise per sequence
