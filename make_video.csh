@@ -1,1 +1,1 @@
-python make_video.py --results results_test --fps 5 --tag s25_l25
+python make_video.py --results results_test_yuv_check --fps 5 --tag s25_l25

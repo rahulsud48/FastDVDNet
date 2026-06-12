@@ -1,20 +1,19 @@
 """
-Trains FastDVDnet (single-frame + KV bank).
+Trains FastDVDnet (single-frame + KV bank), full-scene scheme.
 
-Identical to working uploaded version with two additions:
-  1. Shot noise (Poisson) applied on top of Gaussian noise per frame
-  2. lambda_shot map passed to model alongside existing noise_map (sigma_read)
-  3. Loss: MSE(denoised, gt) — image space
+Two input paths selected by --yuv:
+  RGB path: input = cat[noisy RGB(3), sigma_read(1), lambda_shot(1)] (5ch)
+            loss = MSE(denoised_rgb, clean_rgb)
+  YUV path: noise added in RGB, then RGB->YUV420 (UV at /4).
+            model(y_noisy, uv_noise, bank_k, bank_v) -> y_res, uv_res
+            loss = w_y*MSE(y_out, y_clean) + w_uv*MSE(uv_out, uv_clean)   [YUV space]
+            reported PSNR (train log + validation) = RGB PSNR (YUV->RGB).
 
-Noise pipeline per frame:
-  sigma ~ Uniform[noise_ival[0], noise_ival[1]]  (AWGN std, same as before)
-  lam   ~ Uniform[lam_ival[0], lam_ival[1]]      (Poisson lambda scale, new)
-
-  noisy = Poisson(clean, lam) + N(0, sigma^2)
-
-Noise maps passed to model:
-  sigma_read_map  : (N, 1, H, W) flat scalar — AWGN is spatially uniform
-  lambda_shot_map : (N, 1, H, W) per-pixel = luma(h,w) * lam — heteroscedastic
+Full-scene scheme (both paths):
+  - process scene_length consecutive frames sequentially
+  - per-frame loss, loss.backward() each frame (grad accumulates), bank detached
+  - one optimizer.step() per scene
+  - sigma & lambda sampled once per scene
 """
 
 import os, sys
@@ -23,50 +22,49 @@ import argparse
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import torchvision.utils as tutils
 import time as _time
 
-from models import FastDVDnet#, KVBank
+from models import FastDVDnet
 from dataset import ValDataset
 from simple_dataloader import train_simple_loader
 from utils import svd_orthogonalization, close_logger, init_logging, normalize_augment, batch_psnr
 from train_common import (resume_training, lr_scheduler, log_train_psnr,
                           save_model_checkpoint)
 from fastdvdnet import denoise_seq_fastdvdnet
+from yuv_utils import rgb_to_yuv420, yuv420_to_rgb
 
 
 # ---------------------------------------------------------------------------
-# Validation
+# Validation — reports RGB PSNR in both modes.
 # ---------------------------------------------------------------------------
-
 def validate_and_log_singleframe(model, dataset_val, valnoisestd, val_lam,
-                                  bank_size, writer, epoch, lr, logger, trainimg):
-    """Validation: fixed sigma + fixed lambda, same noise pipeline as training."""
+                                  bank_size, writer, epoch, lr, logger, trainimg, yuv):
     t1 = _time.time()
     psnr_val = 0.0
+    psnr_y_val = 0.0
+    psnr_uv_val = 0.0
     model.eval()
 
     with torch.no_grad():
         for seq_idx, seq_val in enumerate(dataset_val):
             torch.manual_seed(epoch * 1000 + seq_idx)
-
             T, C, H, W = seq_val.shape
 
-            # Apply same noise as training: shot then read
+            # Build noisy RGB sequence (shot then read), same pipeline as train.
             noisy_frames = []
             for t in range(T):
                 frame = seq_val[t].unsqueeze(0)
-                # Shot noise (Poisson)
                 photons = (frame * 255.0 / val_lam).clamp(1e-6)
                 frame   = (torch.poisson(photons) * val_lam / 255.0).clamp(0., 1.)
-                # Read noise (AWGN)
                 frame   = (frame + torch.randn_like(frame) * valnoisestd).clamp(0., 1.)
                 noisy_frames.append(frame)
+            seqn_val = torch.cat(noisy_frames, dim=0)           # CPU (T,3,H,W)
 
-            seqn_val = torch.cat(noisy_frames, dim=0).cuda()
-            sigma_noise = torch.cuda.FloatTensor([valnoisestd])
-
+            sigma_noise = torch.FloatTensor([valnoisestd])
+            # denoise_seq returns RGB in both modes.
             out_val = denoise_seq_fastdvdnet(
                 seq=seqn_val,
                 noise_std=sigma_noise,
@@ -74,13 +72,29 @@ def validate_and_log_singleframe(model, dataset_val, valnoisestd, val_lam,
                 temp_psz=None,
                 model_temporal=model,
                 bank_size=bank_size,
+                yuv=yuv,
             )
-            psnr_val += batch_psnr(out_val.cpu(), seq_val.squeeze_(), 1.)
+            clean_seq = seq_val.squeeze_()                       # (T,3,H,W) clean RGB
+            psnr_val += batch_psnr(out_val.cpu(), clean_seq, 1.)
 
-        psnr_val /= len(dataset_val)
+            # Diagnostic: Y and UV PSNR. Convert both denoised and clean RGB to
+            # YUV420 and compare per channel. Tells us whether a low RGB PSNR is
+            # driven by luma error, chroma error, or the YUV<->RGB conversion.
+            y_den,  uv_den  = rgb_to_yuv420(out_val.cpu(),   uv_down=4)
+            y_cln,  uv_cln  = rgb_to_yuv420(clean_seq.cpu(), uv_down=4)
+            psnr_y_val  += batch_psnr(y_den,  y_cln,  1.)
+            psnr_uv_val += batch_psnr(uv_den, uv_cln, 1.)
+
+        nseq = len(dataset_val)
+        psnr_val    /= nseq
+        psnr_y_val  /= nseq
+        psnr_uv_val /= nseq
         t2 = _time.time()
-        print("\n[epoch %d] PSNR_val: %.4f, on %.2f sec" % (epoch + 1, psnr_val, t2 - t1))
+        print("\n[epoch %d] PSNR_val  RGB: %.4f | Y: %.4f | UV: %.4f  (%.2f sec)"
+              % (epoch + 1, psnr_val, psnr_y_val, psnr_uv_val, t2 - t1))
         writer.add_scalar('PSNR on validation data', psnr_val, epoch)
+        writer.add_scalar('PSNR val Y',  psnr_y_val,  epoch)
+        writer.add_scalar('PSNR val UV', psnr_uv_val, epoch)
         writer.add_scalar('Learning rate', lr, epoch)
 
     try:
@@ -96,17 +110,18 @@ def validate_and_log_singleframe(model, dataset_val, valnoisestd, val_lam,
     except Exception as e:
         logger.error("validate_and_log_singleframe(): {}".format(e))
 
-    return psnr_val
+    return psnr_val, psnr_y_val, psnr_uv_val
 
 
 # ---------------------------------------------------------------------------
-# Main training loop
+# Main
 # ---------------------------------------------------------------------------
-
 def main(**args):
+    yuv = args['yuv']
+    w_y, w_uv = args['w_y'], args['w_uv']
 
     print('> Loading datasets ...')
-    dataset_val  = ValDataset(valsetdir=args['valset_dir'], gray_mode=False)
+    dataset_val = ValDataset(valsetdir=args['valset_dir'], gray_mode=False)
     loader_train = train_simple_loader(
         batch_size=args['batch_size'],
         file_root=args['trainset_dir'],
@@ -116,35 +131,30 @@ def main(**args):
         epoch_size=args['max_number_patches'],
         random_shuffle=True,
         temp_stride=args['temp_stride'],
-        num_workers=args['num_workers'],         # 0 if shm-limited
+        num_workers=args['num_workers'],
     )
 
     num_minibatches = int(args['max_number_patches'] // args['batch_size'])
-    # ctrl_fr_idx     = (args['temp_patch_size'] - 1) // 2
     print("\t# of training samples: %d\n" % int(args['max_number_patches']))
 
     writer, logger = init_logging(args)
 
-    # Model
     torch.backends.cudnn.benchmark = True
     model = FastDVDnet(
         bank_size=args['bank_size'],
         num_heads=args['num_heads'],
         pool_size=args['pool_size'],
-        train_mode = True
+        train_mode=True,
     )
     print("########### Model Architecture ###############")
     print(model)
     model = nn.DataParallel(model, device_ids=[0]).cuda()
 
-    # Loss: MSE(denoised, clean GT) — image space
     criterion = nn.MSELoss(reduction='sum')
     criterion.cuda()
-
     optimizer = optim.Adam(model.parameters(), lr=args['lr'])
 
     start_epoch, training_params = resume_training(args, model, optimizer)
-
     if 'best_psnr' not in training_params:
         training_params['best_psnr']  = 0.0
         training_params['best_epoch'] = 0
@@ -152,7 +162,6 @@ def main(**args):
     start_time = time.time()
 
     for epoch in range(start_epoch, args['epochs']):
-
         current_lr, reset_orthog = lr_scheduler(epoch, args)
         if reset_orthog:
             training_params['no_orthog'] = True
@@ -161,74 +170,89 @@ def main(**args):
         print('\nlearning rate %f' % current_lr)
 
         for i, data in enumerate(loader_train, 0):
-
             model.train()
             optimizer.zero_grad()
 
-            # img_train, gt_train = normalize_augment(data['data'], ctrl_fr_idx)
-            img_train, gt_train = normalize_augment(data['data'])
+            img_train, gt_train = normalize_augment(data['data'])   # clean RGB stack, [0,1]
             N, _, H, W = img_train.size()
             num_frames = args['temp_patch_size']
 
-            # Sample noise level — same standard as original FastDVDnet
+            # sigma & lambda sampled ONCE per scene
             stdn = torch.empty((N, 1, 1, 1)).cuda().uniform_(
                 args['noise_ival'][0], args['noise_ival'][1])
-
-            # Sample Poisson lambda — same range convention [0,1]
             lam = torch.empty((N, 1, 1, 1)).cuda().uniform_(
                 args['lam_ival'][0], args['lam_ival'][1])
 
-            gt_train = gt_train.cuda(non_blocking=True)
+            sigma_read_map = stdn.expand(N, 1, H, W)    # RGB-path full-res map
 
-            # sigma_read map: flat scalar — AWGN is spatially uniform
-            sigma_read_map = stdn.expand(N, 1, H, W)   # (N, 1, H, W)
+            bank_k = torch.zeros(N, 10 * 64, 64).cuda()
+            bank_v = torch.zeros(N, 10 * 64, 64).cuda()
 
-            # bank     = KVBank(bank_size=args['bank_size'], detach=False)
-            bank_k = torch.zeros(N,10*64,64).cuda()
-            bank_v = torch.zeros(N,10*64,64).cuda()
-            loss     = torch.tensor(0.0).cuda()
-            out_train = None
+            scene_loss_log = 0.0
+            out_rgb_last, gt_rgb_last = None, None
+
             for t in range(num_frames):
-                ft = img_train[:, 3*t:3*t+3, :, :].cuda(non_blocking=True)
-                gt_t = gt_train[:, 3*t:3*t+3, :, :].cuda(non_blocking=True)
-                # Shot noise (Poisson) — applied first (optical before electronic)
-                photons = (ft * 255.0 / lam.expand_as(ft)).clamp(1e-6)
-                ft_shot = (torch.poisson(photons) * lam.expand_as(ft) / 255.0).clamp(0., 1.)
+                clean = img_train[:, 3*t:3*t+3, :, :].cuda(non_blocking=True)   # clean RGB
 
-                # Read noise (AWGN) — applied after shot noise
-                noise   = torch.normal(mean=torch.zeros_like(ft_shot),
-                                       std=stdn.expand_as(ft_shot))
-                ftn     = (ft_shot + noise).clamp(0., 1.)
+                # Noise in RGB (shot then read)
+                photons = (clean * 255.0 / lam.expand_as(clean)).clamp(1e-6)
+                shot    = (torch.poisson(photons) * lam.expand_as(clean) / 255.0).clamp(0., 1.)
+                noise   = torch.normal(mean=torch.zeros_like(shot), std=stdn.expand_as(shot))
+                noisy   = (shot + noise).clamp(0., 1.)
 
-                # lambda_shot map: spatially varying — luma * lam
-                # heteroscedastic: brighter pixels have more shot noise
-                lambda_shot_map = (ftn.mean(dim=1, keepdim=True) *
-                                   lam.expand(N, 1, H, W)).clamp(1e-6, 1.0)
+                if yuv:
+                    # noisy & clean -> YUV420 (UV at /4)
+                    y_n, uv_n = rgb_to_yuv420(noisy, uv_down=4)
+                    y_c, uv_c = rgb_to_yuv420(clean, uv_down=4)
 
+                    Hq, Wq = y_n.shape[-2] // 4, y_n.shape[-1] // 4
+                    s_map = torch.full((N, 1, Hq, Wq), 0.0, device=y_n.device)
+                    s_map = s_map + stdn.view(N, 1, 1, 1)          # flat sigma at /4
+                    luma_q = F.avg_pool2d(y_n, 4)
+                    l_map = (luma_q * lam.view(N, 1, 1, 1)).clamp(1e-6, 1.0)
+                    uv_noise = torch.cat([uv_n, s_map, l_map], dim=1)   # (N,4,Hq,Wq)
 
-                input_data = torch.cat((ftn, sigma_read_map, lambda_shot_map), dim = 1)
-                # Forward pass
-                res_t, curr_k, curr_v = model(input_data, bank_k, bank_v)
-                out_t = ftn - res_t
+                    y_res, uv_res, curr_k, curr_v = model(y_n, uv_noise, bank_k, bank_v)
+                    y_out  = y_n  - y_res
+                    uv_out = uv_n - uv_res
+
+                    # Loss in YUV (weighted). reduction='sum' / (N*2*frames).
+                    loss_y  = criterion(y_out,  y_c)  / (N * 2 * num_frames)
+                    loss_uv = criterion(uv_out, uv_c) / (N * 2 * num_frames)
+                    loss = w_y * loss_y + w_uv * loss_uv
+                    loss.backward()
+
+                    # RGB reconstruction for logging only (detached)
+                    with torch.no_grad():
+                        out_rgb_last = yuv420_to_rgb(y_out.detach().clamp(0,1),
+                                                     uv_out.detach().clamp(0,1))
+                        gt_rgb_last = clean
+                else:
+                    lambda_shot_map = (noisy.mean(dim=1, keepdim=True) *
+                                       lam.expand(N, 1, H, W)).clamp(1e-6, 1.0)
+                    input_data = torch.cat((noisy, sigma_read_map, lambda_shot_map), dim=1)
+                    res_t, curr_k, curr_v = model(input_data, bank_k, bank_v)
+                    out_t = noisy - res_t
+                    loss = criterion(out_t, clean) / (N * 2 * num_frames)
+                    loss.backward()
+                    out_rgb_last, gt_rgb_last = out_t.detach(), clean
+
                 bank_k = torch.cat([bank_k[:, 64:, :], curr_k.detach()], dim=1)
                 bank_v = torch.cat([bank_v[:, 64:, :], curr_v.detach()], dim=1)
-                # Loss on central frame: MSE(denoised, clean GT)
-                # if t == ctrl_fr_idx:
-                loss      = criterion(out_t, gt_t) / (N * 2)
-                out_train = out_t
-                loss.backward()
+                scene_loss_log += float(loss.item())
+
             optimizer.step()
 
             if training_params['step'] % args['save_every'] == 0:
                 if not training_params['no_orthog']:
                     model.apply(svd_orthogonalization)
-                log_train_psnr(out_train, gt_t, loss,
+                loss_tensor = torch.tensor(scene_loss_log)
+                log_train_psnr(out_rgb_last.clamp(0, 1), gt_rgb_last, loss_tensor,
                                writer, epoch, i, num_minibatches, training_params)
 
             training_params['step'] += 1
 
-        # Validation
-        psnr_val = validate_and_log_singleframe(
+        psnr_val, psnr_y_val, psnr_uv_val = validate_and_log_singleframe(
             model=model.module,
             dataset_val=dataset_val,
             valnoisestd=args['val_noiseL'],
@@ -239,23 +263,37 @@ def main(**args):
             lr=current_lr,
             logger=logger,
             trainimg=img_train,
+            yuv=yuv,
         )
 
-        # Best model tracking
-        if psnr_val > training_params['best_psnr']:
-            training_params['best_psnr']  = psnr_val
-            training_params['best_epoch'] = epoch + 1
-            torch.save(model.state_dict(),
-                       os.path.join(args['log_dir'], 'net_best.pth'))
-            print("  ★ New best PSNR: {:.4f} dB at epoch {} — saved net_best.pth"
-                  .format(psnr_val, epoch + 1))
-            logger.info("New best PSNR: {:.4f} dB at epoch {}"
-                        .format(psnr_val, epoch + 1))
+        # Selection score:
+        #   YUV mode -> weighted Y+UV (same weights as the loss), since the
+        #     model operates in YUV and RGB is just a derived view. This avoids
+        #     letting YUV<->RGB conversion artifacts drive checkpoint choice.
+        #   RGB mode -> plain RGB PSNR.
+        if yuv:
+            sel_score = w_y * psnr_y_val + w_uv * psnr_uv_val
+            sel_name  = "Y+UV (w_y*Y + w_uv*UV)"
         else:
-            print("  (best: {:.4f} dB at epoch {})".format(
-                training_params['best_psnr'], training_params['best_epoch']))
+            sel_score = psnr_val
+            sel_name  = "RGB"
 
-        writer.add_scalar('Best PSNR', training_params['best_psnr'], epoch)
+        if sel_score > training_params['best_psnr']:
+            training_params['best_psnr']  = sel_score
+            training_params['best_epoch'] = epoch + 1
+            torch.save(model.state_dict(), os.path.join(args['log_dir'], 'net_best.pth'))
+            print("  New best [{}]: {:.4f} at epoch {}  "
+                  "(RGB {:.4f} | Y {:.4f} | UV {:.4f}) — saved net_best.pth"
+                  .format(sel_name, sel_score, epoch + 1,
+                          psnr_val, psnr_y_val, psnr_uv_val))
+            logger.info("New best [{}]: {:.4f} at epoch {} (RGB {:.4f} | Y {:.4f} | UV {:.4f})"
+                        .format(sel_name, sel_score, epoch + 1,
+                                psnr_val, psnr_y_val, psnr_uv_val))
+        else:
+            print("  (best [{}]: {:.4f} at epoch {})".format(
+                sel_name, training_params['best_psnr'], training_params['best_epoch']))
+
+        writer.add_scalar('Best selection score', training_params['best_psnr'], epoch)
         training_params['start_epoch'] = epoch + 1
         save_model_checkpoint(model, args, optimizer, training_params, epoch)
 
@@ -264,15 +302,9 @@ def main(**args):
     close_logger(logger)
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Train FastDVDnet (KV bank, RGB/YUV)")
 
-    parser = argparse.ArgumentParser(description="Train FastDVDnet (single-frame + KV bank)")
-
-    # Training — identical to original
     parser.add_argument("--batch_size",             type=int,   default=64)
     parser.add_argument("--epochs", "--e",           type=int,   default=80)
     parser.add_argument("--resume_training", "--r",  action='store_true')
@@ -282,40 +314,34 @@ if __name__ == "__main__":
     parser.add_argument("--save_every",              type=int,   default=10)
     parser.add_argument("--save_every_epochs",       type=int,   default=5)
 
-    # Noise — same convention as original (integer [0,255], divided by 255 below)
-    parser.add_argument("--noise_ival",   nargs=2, type=int, default=[5, 55],
-                        help="AWGN sigma training interval in [0,255]")
-    parser.add_argument("--val_noiseL",   type=float, default=25,
-                        help="AWGN sigma for validation in [0,255]")
+    parser.add_argument("--noise_ival",   nargs=2, type=int, default=[5, 55])
+    parser.add_argument("--val_noiseL",   type=float, default=25)
+    parser.add_argument("--lam_ival",     nargs=2, type=int, default=[5, 55])
+    parser.add_argument("--val_lam",      type=float, default=25)
 
-    # Shot noise — same convention (integer [0,255], divided by 255 below)
-    parser.add_argument("--lam_ival",     nargs=2, type=int, default=[5, 55],
-                        help="Poisson lambda training interval in [0,255]")
-    parser.add_argument("--val_lam",      type=float, default=25,
-                        help="Poisson lambda for validation in [0,255]")
-
-    # Patch / sequence
-    # parser.add_argument("--patch_size", "--p",       type=int, default=96)
     parser.add_argument("--patch_h", type=int, default=96)
     parser.add_argument("--patch_w", type=int, default=96)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--temp_patch_size", "--tp", type=int, default=20)
-    parser.add_argument("--max_number_patches","--m",type=int, default=256000)
-    parser.add_argument("--temp_stride",type=int, default=3)
+    parser.add_argument("--max_number_patches", "--m", type=int, default=256000)
+    parser.add_argument("--temp_stride", type=int, default=3)
 
-    # KV bank
     parser.add_argument("--bank_size",  type=int, default=10)
     parser.add_argument("--num_heads",  type=int, default=4)
     parser.add_argument("--pool_size",  type=int, default=8)
 
-    # Dirs
+    # YUV mode
+    parser.add_argument("--yuv", action='store_true',
+                        help="Use YUV420 path (Y full-res + UV at /4). Default: RGB path.")
+    parser.add_argument("--w_y",  type=float, default=1.0,  help="Y loss weight (YUV mode)")
+    parser.add_argument("--w_uv", type=float, default=0.25, help="UV loss weight (YUV mode)")
+
     parser.add_argument("--log_dir",        type=str, default="logs")
     parser.add_argument("--trainset_dir",   type=str, default=None)
     parser.add_argument("--valset_dir",     type=str, default=None)
 
     argspar = parser.parse_args()
 
-    # Normalize to [0,1] — same standard as original FastDVDnet
     argspar.val_noiseL    /= 255.
     argspar.noise_ival[0] /= 255.
     argspar.noise_ival[1] /= 255.
@@ -323,7 +349,7 @@ if __name__ == "__main__":
     argspar.lam_ival[0]   /= 255.
     argspar.lam_ival[1]   /= 255.
 
-    print("\n### Training FastDVDnet (single-frame + KV bank + shot+read noise) ###")
+    print("\n### Training FastDVDnet (%s) ###" % ("YUV420" if argspar.yuv else "RGB"))
     for p, v in zip(argspar.__dict__.keys(), argspar.__dict__.values()):
         print('\t{}: {}'.format(p, v))
     print('\n')

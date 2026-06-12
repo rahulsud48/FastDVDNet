@@ -51,7 +51,7 @@ class InputCvBlock(nn.Module):
         # self.interm_ch = 30
         # 3 (RGB) + 1 (sigma_read) + 1 (lambda_shot) = 5 input channels
         self.Input_Cv_Block = nn.Sequential(
-            nn.Conv2d(5, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(1, out_channels, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True),
         )
@@ -207,15 +207,16 @@ class DenBlock(nn.Module):
         self.channels_layer1 = 32
         self.channels_layer2 = 64
 
-        self.input_conv_block    = InputCvBlock(out_channels=self.channels_layer0)   # 5ch input
+        self.input_conv_block    = InputCvBlock(out_channels=self.channels_layer0)   # Y-ch input
         self.downsample0 = DownBlock(in_channels=self.channels_layer0, out_channels=self.channels_layer1)
-        self.downsample1 = DownBlock(in_channels=self.channels_layer1, out_channels=self.channels_layer2)
+        self.downsample1 = DownBlock(in_channels=self.channels_layer1, out_channels=self.channels_layer2 - 4)
         self.kv_attn = BottleneckCrossAttn(ch=self.channels_layer2,
                                            num_heads=num_heads,
                                            pool_size=pool_size, train_mode=train_mode)
         self.upsample2 = UpBlock(in_channels=self.channels_layer2, out_channels=self.channels_layer1)
         self.upsample1 = UpBlock(in_channels=self.channels_layer1, out_channels=self.channels_layer0)
-        self.output_conv_block = OutputCvBlock(in_channels=self.channels_layer0, out_channels=3)
+        self.output_conv_block_y = OutputCvBlock(in_channels=self.channels_layer0, out_channels=1)
+        self.output_conv_block_uv = OutputCvBlock(in_channels=self.channels_layer2, out_channels=2)
         # self.reset_params()
 
     # @staticmethod
@@ -227,23 +228,25 @@ class DenBlock(nn.Module):
     #     for _, m in enumerate(self.modules()):
     #         self.weight_init(m)
 
-    def forward(self, x, bank_k, bank_v):
+    def forward(self, x, uv_noise, bank_k, bank_v):
         # Concat: RGB + sigma_read + lambda_shot = 5 channels
         x0 = self.input_conv_block(x)
         x1 = self.downsample0(x0)
         x2 = self.downsample1(x1)
+        x2 = torch.cat((x2, uv_noise), dim = 1)
 
         x2, k_cur, v_cur = self.kv_attn(x2, bank_k, bank_v)
+        uv_res  = self.output_conv_block_uv(x2)
 
         x2 = self.upsample2(x2)
         x1 = self.upsample1(x1 + x2)
-        x  = self.output_conv_block(x0 + x1)
+        x  = self.output_conv_block_y(x0 + x1)
 
-        return x, k_cur, v_cur
+        return x, uv_res, k_cur, v_cur
 
 
 class FastDVDnet(nn.Module):
-    def __init__(self, bank_size: int = 10, num_heads: int = 4, pool_size: int = 8, train_mode = True):
+    def __init__(self, bank_size: int = 10, num_heads: int = 4, pool_size: int = 8, train_mode = False):
         super(FastDVDnet, self).__init__()
         self.num_input_frames = 1
         self.temp = DenBlock(bank_size=bank_size, num_heads=num_heads, pool_size=pool_size, train_mode = train_mode)
@@ -258,8 +261,8 @@ class FastDVDnet(nn.Module):
     #     for _, m in enumerate(self.modules()):
     #         self.weight_init(m)
 
-    def forward(self, input_data, bank_k, bank_v):
-        return self.temp(input_data, bank_k, bank_v)
+    def forward(self, input_data, uv_noise, bank_k, bank_v):
+        return self.temp(input_data, uv_noise, bank_k, bank_v)
 
 
 if __name__ == "__main__":
@@ -275,12 +278,13 @@ if __name__ == "__main__":
     W = 96
     with torch.no_grad():
         for t in range(12):
-            frame    = torch.randn(1, 3, H, W)
-            s_map    = torch.full((1, 1, H, W), 0.02)
-            l_map    = torch.rand(1, 1, H, W) * 0.5
-            input_data = torch.cat((frame, s_map, l_map), dim = 1)
-            denoised, curr_k, curr_v = model(input_data, bank_k, bank_v)
+            y_frame    = torch.randn(1, 1, H, W)
+            uv_frame    = torch.randn(1, 2, H//4, W//4)
+            s_map    = torch.full((1, 1, H//4, W//4), 0.02)
+            l_map    = torch.rand(1, 1, H//4, W//4) * 0.5
+            uv_noise_input = torch.cat((uv_frame, s_map, l_map), dim = 1)
+            y_res, uv_res, curr_k, curr_v = model(y_frame, uv_noise_input, bank_k, bank_v)
             bank_k = torch.cat([bank_k[:, 64:, :], curr_k], dim=1)
             bank_v = torch.cat([bank_v[:, 64:, :], curr_v], dim=1)
-            print(f"t={t}  bank_k={bank_k.shape}  out={denoised.shape}")
+            print(f"t={t}  bank_k={bank_k.shape}  y_res={y_res.shape} uv_res={uv_res.shape}")
     print("Sanity check passed!")

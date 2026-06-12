@@ -91,3 +91,6 @@ results_test/
 logs_test_v3/
 logs_test_v2/
 logs_kvbank_32_32_64/
+results_test_yuv_check/
+.gitignore
+logs_kvbank_yuv420_32_32_64/
