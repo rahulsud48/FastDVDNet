@@ -203,9 +203,9 @@ class DenBlock(nn.Module):
     """
     def __init__(self, bank_size: int = 10, num_heads: int = 4, pool_size: int = 8, train_mode = True):
         super(DenBlock, self).__init__()
-        self.channels_layer0 = 32
-        self.channels_layer1 = 32
-        self.channels_layer2 = 64
+        self.channels_layer0 = 16
+        self.channels_layer1 = 16
+        self.channels_layer2 = 32
 
         self.input_conv_block    = InputCvBlock(out_channels=self.channels_layer0)   # Y-ch input
         self.downsample0 = DownBlock(in_channels=self.channels_layer0, out_channels=self.channels_layer1)
@@ -267,15 +267,15 @@ class FastDVDnet(nn.Module):
 
 if __name__ == "__main__":
     bank_size = 10
-    model = FastDVDnet(bank_size=bank_size, num_heads=1, pool_size=8, train_mode=True)
-    bank_k = torch.randn(1,10*64,64)
-    bank_v = torch.randn(1,10*64,64)
+    model = FastDVDnet(bank_size=bank_size, num_heads=1, pool_size=8, train_mode=False)
+    bank_k = torch.randn(1,10*64,32)
+    bank_v = torch.randn(1,10*64,32)
     # bank  = KVBank(bank_size=bank_size)
     model.eval()
-    # H = 1080
-    # W = 1920
-    H = 96
-    W = 96
+    H = 1080
+    W = 1920
+    # H = 96
+    # W = 96
     with torch.no_grad():
         for t in range(12):
             y_frame    = torch.randn(1, 1, H, W)

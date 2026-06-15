@@ -185,8 +185,8 @@ def main(**args):
 
             sigma_read_map = stdn.expand(N, 1, H, W)    # RGB-path full-res map
 
-            bank_k = torch.zeros(N, 10 * 64, 64).cuda()
-            bank_v = torch.zeros(N, 10 * 64, 64).cuda()
+            bank_k = torch.zeros(N, 10 * 64, 32).cuda()
+            bank_v = torch.zeros(N, 10 * 64, 32).cuda()
 
             scene_loss_log = 0.0
             out_rgb_last, gt_rgb_last = None, None

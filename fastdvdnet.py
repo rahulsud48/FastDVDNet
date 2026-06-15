@@ -117,8 +117,8 @@ def denoise_seq_fastdvdnet(seq, noise_std, lambda_shot, temp_psz,
 
     sigma = float(noise_std.item()) if torch.is_tensor(noise_std) else float(noise_std)
 
-    bank_k = torch.zeros(1, 10 * 64, 64).cuda()
-    bank_v = torch.zeros(1, 10 * 64, 64).cuda()
+    bank_k = torch.zeros(1, 10 * 64, 32).cuda()
+    bank_v = torch.zeros(1, 10 * 64, 32).cuda()
 
     if not yuv:
         sigma_read_map = noise_std.expand((1, 1, H, W))
