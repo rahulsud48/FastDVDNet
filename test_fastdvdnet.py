@@ -19,6 +19,8 @@ import torch.nn as nn
 
 from models import FastDVDnet
 from fastdvdnet import denoise_seq_fastdvdnet
+# QAT: convert helpers for loading a QAT checkpoint and running INT8.
+from qat_utils import prepare_model_qat, convert_to_int8
 from utils import (batch_psnr, init_logger_test,
                    variable_to_cv2_image, remove_dataparallel_wrapper,
                    open_sequence, close_logger)
@@ -97,14 +99,27 @@ def test_fastdvdnet(**args):
         num_heads=args['num_heads'],
         pool_size=args['pool_size'],
         train_mode=False,
+        quantize_bank=not args['no_quantize_bank'],   # QAT: match training
+        input_bits=args['input_bits'],                # QAT: deploy-time input bit-depth
     )
     state_dict = torch.load(args['model_file'], map_location=device)
-    if args['cuda']:
-        model_temp = nn.DataParallel(model_temp, device_ids=[0]).cuda()
+    if args['qat_int8']:
+        # QAT: checkpoint is a QAT-prepared model. Rebuild the QAT structure,
+        #      load weights, then convert() to a true-INT8 model (CPU).
+        if any(k.startswith('module.') for k in state_dict):
+            state_dict = remove_dataparallel_wrapper(state_dict)
+        prep = prepare_model_qat(model_temp)
+        prep.load_state_dict(state_dict)
+        model_temp = convert_to_int8(prep)            # QAT: true INT8, runs on CPU
+        model_temp.eval()
+        print('QAT: loaded checkpoint -> converted to INT8 (CPU).')
     else:
-        state_dict = remove_dataparallel_wrapper(state_dict)
-    model_temp.load_state_dict(state_dict)
-    model_temp.eval()
+        if args['cuda']:
+            model_temp = nn.DataParallel(model_temp, device_ids=[0]).cuda()
+        else:
+            state_dict = remove_dataparallel_wrapper(state_dict)
+        model_temp.load_state_dict(state_dict)
+        model_temp.eval()
     print(f'Model loaded.  tag={tag}  mode={"YUV" if yuv else "RGB"}\n')
 
     seq_dirs = find_sequence_dirs(args['test_path'])
@@ -147,6 +162,7 @@ def test_fastdvdnet(**args):
                 model_temporal=model_temp,
                 bank_size=args['bank_size'],
                 yuv=yuv,
+                device = "cpu"
             )
             run_t = time.time() - seq_start - load_t
 
@@ -195,6 +211,13 @@ if __name__ == "__main__":
     parser.add_argument("--pool_size",    type=int,   default=8)
     parser.add_argument("--yuv",          action='store_true',
                         help="Use YUV420 path. Default: RGB path.")
+    # QAT: INT8 inference flags.
+    parser.add_argument("--qat_int8", action='store_true',
+                        help="QAT: load QAT checkpoint, convert to INT8, run INT8 (CPU)")
+    parser.add_argument("--no_quantize_bank", action='store_true',
+                        help="QAT: match a model trained with float bank")
+    parser.add_argument("--input_bits", type=int, default=8,
+                        help="QAT: deploy-time input bit-depth")
     parser.add_argument("--dont_save_results", action='store_true')
     parser.add_argument("--no_gpu",       action='store_true')
     parser.add_argument("--gray",         action='store_true')

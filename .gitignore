@@ -96,3 +96,7 @@ results_test_yuv_check/
 logs_kvbank_yuv420_32_32_64/
 logs_kvbank_yuv420_16_16_32/
 results_test_yuv420_16_16_32/
+results_test_qat/
+logs_test_qat/
+run_test.csh
+result_test_qat/

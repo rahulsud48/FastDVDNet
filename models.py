@@ -11,6 +11,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import sys
 
+# QAT: quantization stubs + FloatFunctional for observed elementwise/matmul ops.
+from torch.ao.quantization import QuantStub, DeQuantStub
+from torch.ao.nn.quantized import FloatFunctional
+
 class learningBlock(nn.Module):
     def __init__(self, in_channels, out_channels):
         super(learningBlock, self).__init__()
@@ -165,6 +169,18 @@ class BottleneckCrossAttn(nn.Module):
         # self.attn = nn.MultiheadAttention(ch, num_heads, batch_first=True)
         self.gate = nn.Sequential(nn.Linear(ch, ch), nn.Sigmoid())
 
+        # QAT: FloatFunctional wrappers so these ops are observed/quantized.
+        self.attn_qk  = FloatFunctional()   # q @ bank_k^T
+        self.attn_av  = FloatFunctional()   # attn_map @ bank_v
+        self.gate_mul = FloatFunctional()   # x * gate
+        self.gate_add = FloatFunctional()   # (x*gate) + x
+        # QAT: bank enters quantized domain via these stubs.
+        self.quant_bank_k = QuantStub()
+        self.quant_bank_v = QuantStub()
+        # QAT: softmax has no quantized kernel -> run it in float.
+        self.deq_pre_softmax = DeQuantStub()
+        self.q_post_softmax  = QuantStub()
+
     def _to_tokens(self, feat):
         return self.pool(feat).flatten(2).transpose(1, 2)
 
@@ -180,12 +196,22 @@ class BottleneckCrossAttn(nn.Module):
         #     return x, k_cur, v_cur
 
         # attn_out, _ = self.attn(q_cur, bank_k, bank_v)
-        qkT = torch.matmul(q_cur, bank_k.transpose(-2,-1))/8.0
+        # QAT: bank K/V quantized on entry.
+        bk = self.quant_bank_k(bank_k)
+        bv = self.quant_bank_v(bank_v)
+        # QAT: matmul via FloatFunctional; keep the /8.0 scale via mul_scalar.
+        qkT = self.attn_qk.matmul(q_cur, bk.transpose(-2,-1))
+        qkT = self.attn_qk.mul_scalar(qkT, 1.0/8.0)
+        # QAT: softmax in float (dequant -> softmax -> requant).
+        qkT = self.deq_pre_softmax(qkT)
         attn_map = F.softmax(qkT, dim=-1)
-        attn_out = torch.matmul(attn_map, bank_v)
+        attn_map = self.q_post_softmax(attn_map)
+        attn_out = self.attn_av.matmul(attn_map, bv)
 
         gate  = self.gate(attn_out.mean(dim=1)).view(N, C, 1, 1)
-        x_out = x * gate + x
+        # QAT: x*gate + x via FloatFunctional.
+        x_g   = self.gate_mul.mul(x, gate)
+        x_out = self.gate_add.add(x_g, x)
         return x_out, k_cur, v_cur
 
 
@@ -217,6 +243,10 @@ class DenBlock(nn.Module):
         self.upsample1 = UpBlock(in_channels=self.channels_layer1, out_channels=self.channels_layer0)
         self.output_conv_block_y = OutputCvBlock(in_channels=self.channels_layer0, out_channels=1)
         self.output_conv_block_uv = OutputCvBlock(in_channels=self.channels_layer2, out_channels=2)
+        # QAT: skip adds + bottleneck concat through FloatFunctional.
+        self.skip_add1 = FloatFunctional()   # x1 + x2
+        self.skip_add0 = FloatFunctional()   # x0 + x1
+        self.bottleneck_cat = FloatFunctional()   # cat((x2, uv_noise))
         # self.reset_params()
 
     # @staticmethod
@@ -233,23 +263,36 @@ class DenBlock(nn.Module):
         x0 = self.input_conv_block(x)
         x1 = self.downsample0(x0)
         x2 = self.downsample1(x1)
-        x2 = torch.cat((x2, uv_noise), dim = 1)
+        # QAT: quantized concat.
+        x2 = self.bottleneck_cat.cat((x2, uv_noise), dim = 1)
 
         x2, k_cur, v_cur = self.kv_attn(x2, bank_k, bank_v)
         uv_res  = self.output_conv_block_uv(x2)
 
         x2 = self.upsample2(x2)
-        x1 = self.upsample1(x1 + x2)
-        x  = self.output_conv_block_y(x0 + x1)
+        # QAT: quantized skip adds.
+        x1 = self.upsample1(self.skip_add1.add(x1, x2))
+        x  = self.output_conv_block_y(self.skip_add0.add(x0, x1))
 
         return x, uv_res, k_cur, v_cur
 
 
 class FastDVDnet(nn.Module):
-    def __init__(self, bank_size: int = 10, num_heads: int = 4, pool_size: int = 8, train_mode = False):
+    def __init__(self, bank_size: int = 10, num_heads: int = 4, pool_size: int = 8, train_mode = False,
+                 quantize_bank: bool = True, input_bits: int = 8):
         super(FastDVDnet, self).__init__()
         self.num_input_frames = 1
         self.temp = DenBlock(bank_size=bank_size, num_heads=num_heads, pool_size=pool_size, train_mode = train_mode)
+        # QAT: input/output quant stubs.
+        self.quant_y   = QuantStub()
+        self.quant_uv  = QuantStub()
+        self.dequant_y = DeQuantStub()
+        self.dequant_uv = DeQuantStub()
+        self.dequant_k = DeQuantStub()
+        self.dequant_v = DeQuantStub()
+        # QAT: input bit-depth kept for deploy-time input-quant (8 now; 10/16 later).
+        self.input_bits = input_bits
+        self.quantize_bank = quantize_bank
         # self.reset_params()
 
     # @staticmethod
@@ -262,7 +305,44 @@ class FastDVDnet(nn.Module):
     #         self.weight_init(m)
 
     def forward(self, input_data, uv_noise, bank_k, bank_v):
-        return self.temp(input_data, uv_noise, bank_k, bank_v)
+        # QAT: quantize inputs, run, dequantize outputs.
+        input_data = self.quant_y(input_data)
+        uv_noise   = self.quant_uv(uv_noise)
+        x, uv_res, k_cur, v_cur = self.temp(input_data, uv_noise, bank_k, bank_v)
+        x      = self.dequant_y(x)
+        uv_res = self.dequant_uv(uv_res)
+        k_cur  = self.dequant_k(k_cur)
+        v_cur  = self.dequant_v(v_cur)
+        return x, uv_res, k_cur, v_cur
+
+    # QAT: fuse conv+bn+relu by Sequential index (preserves your block names).
+    def fuse_model(self):
+        from torch.ao.quantization import fuse_modules
+        for m in self.modules():
+            # learningBlock.learning_block : [conv, bn, relu]
+            if hasattr(m, 'learning_block') and isinstance(m.learning_block, nn.Sequential):
+                fuse_modules(m.learning_block, ['0','1','2'], inplace=True)
+            # InputCvBlock.Input_Cv_Block : [conv, bn, relu]
+            if hasattr(m, 'Input_Cv_Block') and isinstance(m.Input_Cv_Block, nn.Sequential):
+                fuse_modules(m.Input_Cv_Block, ['0','1','2'], inplace=True)
+            # DownBlock.convblock : [conv, bn, relu, learningBlock] -> fuse first 3
+            if hasattr(m, 'convblock') and isinstance(m.convblock, nn.Sequential):
+                fuse_modules(m.convblock, ['0','1','2'], inplace=True)
+            # OutputCvBlock.Output_Cv_Block : [conv, bn, relu, conv] -> fuse first 3
+            if hasattr(m, 'Output_Cv_Block') and isinstance(m.Output_Cv_Block, nn.Sequential):
+                fuse_modules(m.Output_Cv_Block, ['0','1','2'], inplace=True)
+
+    # QAT: attach qconfig. quantize_bank=False leaves attention in float (train-time compare).
+    def set_qconfig(self):
+        from torch.ao.quantization import get_default_qat_qconfig
+        qconfig = get_default_qat_qconfig('x86')
+        self.qconfig = qconfig
+        for m in self.modules():
+            m.qconfig = qconfig
+        if not self.quantize_bank:
+            self.temp.kv_attn.qconfig = None
+            for m in self.temp.kv_attn.modules():
+                m.qconfig = None
 
 
 if __name__ == "__main__":
