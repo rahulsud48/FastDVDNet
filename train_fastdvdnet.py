@@ -34,6 +34,8 @@ from utils import svd_orthogonalization, close_logger, init_logging, normalize_a
 from train_common import (resume_training, lr_scheduler, log_train_psnr,
                           save_model_checkpoint)
 from fastdvdnet import denoise_seq_fastdvdnet
+# QAT: lifecycle helper for prepare_qat.
+from qat_utils import prepare_model_qat
 from yuv_utils import rgb_to_yuv420, yuv420_to_rgb
 
 
@@ -145,10 +147,18 @@ def main(**args):
         num_heads=args['num_heads'],
         pool_size=args['pool_size'],
         train_mode=True,
+        input_bits=args['input_bits'],   # QAT: deploy-time input bit-depth
     )
     print("########### Model Architecture ###############")
     print(model)
-    model = nn.DataParallel(model, device_ids=[0]).cuda()
+    # QAT: prepare for quantization-aware training (fuse -> qconfig -> prepare_qat).
+    #      No DataParallel in QAT mode (eager-mode QAT + DataParallel don't mix).
+    if args['qat']:
+        print('> Preparing model for QAT ...')
+        model = prepare_model_qat(model)
+        model = model.cuda()
+    else:
+        model = nn.DataParallel(model, device_ids=[0]).cuda()
 
     criterion = nn.MSELoss(reduction='sum')
     criterion.cuda()
@@ -252,8 +262,10 @@ def main(**args):
 
             training_params['step'] += 1
 
+        # QAT: model is bare in QAT mode (no DataParallel), wrapped otherwise.
+        val_model = model.module if isinstance(model, nn.DataParallel) else model
         psnr_val, psnr_y_val, psnr_uv_val = validate_and_log_singleframe(
-            model=model.module,
+            model=val_model,
             dataset_val=dataset_val,
             valnoisestd=args['val_noiseL'],
             val_lam=args['val_lam'],
@@ -335,6 +347,9 @@ if __name__ == "__main__":
                         help="Use YUV420 path (Y full-res + UV at /4). Default: RGB path.")
     parser.add_argument("--w_y",  type=float, default=1.0,  help="Y loss weight (YUV mode)")
     parser.add_argument("--w_uv", type=float, default=0.25, help="UV loss weight (YUV mode)")
+    # QAT: quantization-aware training flags. Without --qat, training is FP32.
+    parser.add_argument("--qat", action='store_true', help="QAT: enable quantization-aware training")
+    parser.add_argument("--input_bits", type=int, default=8, help="QAT: deploy-time input bit-depth")
 
     parser.add_argument("--log_dir",        type=str, default="logs")
     parser.add_argument("--trainset_dir",   type=str, default=None)

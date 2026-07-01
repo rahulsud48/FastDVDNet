@@ -22,6 +22,8 @@ from fastdvdnet import denoise_seq_fastdvdnet
 from utils import (batch_psnr, init_logger_test,
                    variable_to_cv2_image, remove_dataparallel_wrapper,
                    open_sequence, close_logger)
+# QAT: build the int8 inference model from a converted checkpoint.
+from qat_utils import prepare_model_qat, convert_to_int8
 
 OUTIMGEXT = '.png'
 IMG_EXTS  = {'.png', '.jpg', '.jpeg', '.bmp', '.tif'}
@@ -92,19 +94,35 @@ def test_fastdvdnet(**args):
     device = torch.device('cuda') if args['cuda'] else torch.device('cpu')
 
     print('Loading model ...')
-    model_temp = FastDVDnet(
-        bank_size=args['bank_size'],
-        num_heads=args['num_heads'],
-        pool_size=args['pool_size'],
-        train_mode=False,
-    )
-    state_dict = torch.load(args['model_file'], map_location=device)
-    if args['cuda']:
-        model_temp = nn.DataParallel(model_temp, device_ids=[0]).cuda()
+    if args['qat']:
+        # QAT: rebuild QAT structure, load the QAT checkpoint, convert to INT8.
+        #      INT8 runs on CPU; device is forced to cpu for the model.
+        model_temp = FastDVDnet(
+            bank_size=args['bank_size'], num_heads=args['num_heads'],
+            pool_size=args['pool_size'], train_mode=False,
+            input_bits=args['input_bits'])
+        model_temp = prepare_model_qat(model_temp)
+        state_dict = torch.load(args['model_file'], map_location='cpu')
+        if any(k.startswith('module.') for k in state_dict):
+            state_dict = remove_dataparallel_wrapper(state_dict)
+        model_temp.load_state_dict(state_dict)
+        model_temp = convert_to_int8(model_temp)   # true INT8, CPU
+        model_temp.eval()
+        print('QAT: loaded checkpoint -> converted to INT8 (CPU).')
     else:
-        state_dict = remove_dataparallel_wrapper(state_dict)
-    model_temp.load_state_dict(state_dict)
-    model_temp.eval()
+        model_temp = FastDVDnet(
+            bank_size=args['bank_size'],
+            num_heads=args['num_heads'],
+            pool_size=args['pool_size'],
+            train_mode=False,
+        )
+        state_dict = torch.load(args['model_file'], map_location=device)
+        if args['cuda']:
+            model_temp = nn.DataParallel(model_temp, device_ids=[0]).cuda()
+        else:
+            state_dict = remove_dataparallel_wrapper(state_dict)
+        model_temp.load_state_dict(state_dict)
+        model_temp.eval()
     print(f'Model loaded.  tag={tag}  mode={"YUV" if yuv else "RGB"}\n')
 
     seq_dirs = find_sequence_dirs(args['test_path'])
@@ -147,6 +165,7 @@ def test_fastdvdnet(**args):
                 model_temporal=model_temp,
                 bank_size=args['bank_size'],
                 yuv=yuv,
+                qat=args['qat'],   # QAT: int8 CPU path when set
             )
             run_t = time.time() - seq_start - load_t
 
@@ -195,6 +214,10 @@ if __name__ == "__main__":
     parser.add_argument("--pool_size",    type=int,   default=8)
     parser.add_argument("--yuv",          action='store_true',
                         help="Use YUV420 path. Default: RGB path.")
+    # QAT: load a converted INT8 model and run INT8 inference (CPU). Without
+    # --qat, this is the normal FP32 test.
+    parser.add_argument("--qat", action='store_true', help="QAT: INT8 inference")
+    parser.add_argument("--input_bits", type=int, default=8, help="QAT: input bit-depth")
     parser.add_argument("--dont_save_results", action='store_true')
     parser.add_argument("--no_gpu",       action='store_true')
     parser.add_argument("--gray",         action='store_true')

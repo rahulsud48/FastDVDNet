@@ -96,7 +96,7 @@ def temp_denoise_yuv(model, y_noisy, uv_noisy, sigma, lam, bank_k, bank_v):
 # Sequence driver
 # ---------------------------------------------------------------------------
 def denoise_seq_fastdvdnet(seq, noise_std, lambda_shot, temp_psz,
-                           model_temporal, bank_size=10, yuv=False):
+                           model_temporal, bank_size=10, yuv=False, qat=False):
     """
     Denoises a sequence frame-by-frame with a fresh KV bank per sequence.
 
@@ -117,14 +117,17 @@ def denoise_seq_fastdvdnet(seq, noise_std, lambda_shot, temp_psz,
 
     sigma = float(noise_std.item()) if torch.is_tensor(noise_std) else float(noise_std)
 
-    bank_k = torch.zeros(1, 10 * 64, 32).cuda()
-    bank_v = torch.zeros(1, 10 * 64, 32).cuda()
+    # QAT: INT8 runs on CPU; bank kept on CPU too. FP32 path unchanged (.cuda()).
+    dev = 'cpu' if qat else 'cuda'
+    bank_k = torch.zeros(1, 10 * 64, 32).to(dev)
+    bank_v = torch.zeros(1, 10 * 64, 32).to(dev)
 
     if not yuv:
         sigma_read_map = noise_std.expand((1, 1, H, W))
 
     for fridx in range(numframes):
-        frame_t = seq[fridx].unsqueeze(0).cuda(non_blocking=True)   # (1,3,H,W) noisy RGB
+        # QAT: frame to CPU in int8 mode, GPU otherwise.
+        frame_t = seq[fridx].unsqueeze(0).to(dev, non_blocking=True)   # (1,3,H,W) noisy RGB
 
         if yuv:
             # noisy RGB -> noisy YUV420 (UV at /4)
@@ -144,5 +147,7 @@ def denoise_seq_fastdvdnet(seq, noise_std, lambda_shot, temp_psz,
         denframes[fridx] = out.squeeze(0).cpu()
         del frame_t, out, curr_k, curr_v
 
-    torch.cuda.empty_cache()
+    # QAT: only clear CUDA cache when on GPU.
+    if dev == 'cuda':
+        torch.cuda.empty_cache()
     return denframes
