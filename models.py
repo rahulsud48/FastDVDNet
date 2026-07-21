@@ -262,9 +262,9 @@ class DenBlock(nn.Module):
 
     def forward(self, x, uv_noise, bank_k, bank_v):
         # Concat: RGB + sigma_read + lambda_shot = 5 channels
-        print(x.dtype)
-        print(uv_noise.dtype)
-        print(bank_k.dtype)
+        # print(x.dtype)
+        # print(uv_noise.dtype)
+        # print(bank_k.dtype)
         x0 = self.input_conv_block(x)
         x1 = self.downsample0(x0)
         x2 = self.downsample1(x1)
@@ -278,10 +278,10 @@ class DenBlock(nn.Module):
         # QAT: quantized skip adds.
         x1 = self.upsample1(self.skip_add1.add(x1, x2))
         x  = self.output_conv_block_y(self.skip_add0.add(x0, x1))
-        print(x.dtype)
-        print(uv_res.dtype)
-        print(k_cur.dtype)
-        sys.exit()
+        # print(x.dtype)
+        # print(uv_res.dtype)
+        # print(k_cur.dtype)
+        # sys.exit()
         return x, uv_res, k_cur, v_cur
 
 

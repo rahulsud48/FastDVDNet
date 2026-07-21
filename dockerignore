@@ -1,0 +1,47 @@
+# The Dockerfile only installs pip packages — it needs NONE of the data below.
+# Excluding these drops the build context from ~24GB to a few KB.
+
+# Datasets
+DAVIS/
+data/
+datasets/
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# Checkpoints / weights / exported models
+logs/
+int8_out/
+*.pth
+*.pt
+*.ckpt
+*.onnx
+
+# Results / rendered frames
+results/
+outputs/
+output/
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.tif
+
+# Python / tooling cruft
+__pycache__/
+*.pyc
+*.pyo
+.git/
+.gitignore
+.vscode/
+.idea/
+runs/
+*.log
+tensorboard/
+*.tfevents.*
+
+# Docker files themselves (not needed inside context)
+Dockerfile
+.dockerignore
+run_docker_container.csh
