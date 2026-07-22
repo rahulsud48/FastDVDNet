@@ -95,7 +95,8 @@ def build_model(args):
         model.train()
 
         if args.export_qconfig:
-            _set_exportable_qconfig(model)   # plain FakeQuantize, exportable
+            _set_exportable_qconfig(model, selective=args.selective_quant,
+                                    ff_names=args.quant_ff)
         else:
             model.set_qconfig()              # original 'x86' (NOT exportable)
 
@@ -128,14 +129,24 @@ def build_model(args):
     return model
 
 
-def _set_exportable_qconfig(model):
+def _set_exportable_qconfig(model, selective=True, ff_names=None):
     """Attach a QConfig whose fake-quant is the plain, ONNX-exportable kind.
 
     'x86' uses FusedMovingAvgObsFakeQuantize -> aten fused_moving_avg_obs_
     fake_quant, which has NO ONNX symbolic at any opset. Plain FakeQuantize ->
     fake_quantize_per_(tensor|channel)_affine, which lowers to QuantizeLinear/
-    DequantizeLinear at opset >= 13. Buffer names/shapes are identical, so an
-    'x86'-trained checkpoint still loads.
+    DequantizeLinear at opset >= 13.
+
+    selective=True: only compute-heavy ops (Conv / Linear / matmul-carrying
+    FloatFunctional) get a qconfig. Everything else gets qconfig=None, which
+    means prepare_qat inserts NO observer and the export emits NO QDQ pair for
+    that module.
+
+    NOTE ON SEMANTICS: eager-mode quantization attaches fake-quant to a
+    module's OUTPUT, not its inputs. So "QDQ before Conv" is really "fake-quant
+    on whatever feeds the Conv". Disabling quant on a producer (e.g. cat) means
+    its consumer receives an unquantized tensor and the graph carries no scale
+    for it -- make sure your compiler can re-derive that scale.
     """
     from torch.ao.quantization import (
         FakeQuantize, MovingAverageMinMaxObserver,
@@ -152,10 +163,47 @@ def _set_exportable_qconfig(model):
         dtype=torch.qint8, qscheme=torch.per_channel_symmetric,
     )
     qconfig = QConfig(activation=act_fq, weight=wt_fq)
-    model.qconfig = qconfig
+
+    if not selective:
+        model.qconfig = qconfig
+        for m in model.modules():
+            m.qconfig = qconfig
+        print("> Set exportable qconfig on ALL modules.")
+        return
+
+    # ---- selective: start from None everywhere, then enable compute ops ----
+    from torch.ao.nn.quantized import FloatFunctional
+    import torch.nn.intrinsic as nni
+
+    model.qconfig = None
     for m in model.modules():
-        m.qconfig = qconfig
-    print("> Set ONNX-exportable qconfig (plain FakeQuantize) before prepare_qat.")
+        m.qconfig = None
+
+    # Module types that should run in int8 (and therefore need fake-quant).
+    QUANT_TYPES = (
+        nn.Conv2d, nn.Linear,
+        # fused variants produced by fuse_model()
+        nni.ConvBn2d, nni.ConvBnReLU2d, nni.ConvReLU2d, nni.LinearReLU,
+    )
+
+    # FloatFunctional instances that carry a matmul (GEMM-like) -> quantize.
+    # Named on the attention module in models.py. Override via --quant_ff.
+    MATMUL_FF_NAMES = set(ff_names) if ff_names else {"attn_qk", "attn_av"}
+
+    n_conv = n_ff = 0
+    for name, m in model.named_modules():
+        if isinstance(m, QUANT_TYPES):
+            m.qconfig = qconfig
+            n_conv += 1
+        elif isinstance(m, FloatFunctional):
+            leaf = name.rsplit(".", 1)[-1]
+            if leaf in MATMUL_FF_NAMES:
+                m.qconfig = qconfig
+                n_ff += 1
+            # skip_add0/1, bottleneck_cat, gate_mul, gate_add stay None
+    print(f"> Selective qconfig: {n_conv} conv/linear + {n_ff} matmul "
+          f"FloatFunctional quantized; all other modules qconfig=None "
+          f"(no QDQ emitted).")
 
 
 def _swap_fused_fakequant(model):
@@ -289,6 +337,15 @@ def main():
                         "(required for fakequant mode; on by default)")
     p.add_argument("--no_export_qconfig", dest="export_qconfig",
                    action="store_false")
+    p.add_argument("--selective_quant", action="store_true", default=True,
+                   help="Only Conv/Linear/matmul get QDQ; softmax, cat, pool, "
+                        "add, upsample get qconfig=None (no QDQ emitted).")
+    p.add_argument("--quant_all", dest="selective_quant", action="store_false",
+                   help="Quantize every module (original blanket behaviour).")
+    p.add_argument("--quant_ff", nargs="*", default=None,
+                   help="FloatFunctional attribute names to quantize. Default: "
+                        "attn_qk attn_av. Use '--quant_ff attn_av' to drop the "
+                        "QDQ between the q.k^T matmul and softmax.")
     p.add_argument("--dynamic", action="store_true", default=False,
                    help="Export with dynamic H/W/bank_len (adds Shape/Gather "
                         "subgraphs). Default is a static graph.")
