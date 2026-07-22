@@ -77,31 +77,40 @@ def build_model(args):
         input_bits=args.input_bits,
     )
 
-    # Correct order: fuse -> set qconfig -> prepare_qat. We set the EXPORTABLE
-    # qconfig BEFORE prepare_qat so plain FakeQuantize modules are instantiated
-    # from the start (setting qconfig AFTER prepare_qat is a no-op — the QAT
-    # modules already exist and won't be re-swapped).
-    from torch.ao.quantization import prepare_qat
-    model.eval()
-    model.fuse_model()
-    model.train()
-
-    if args.export_qconfig:
-        _set_exportable_qconfig(model)   # plain FakeQuantize, exportable
+    if args.mode == "fp32":
+        # Plain FP32 export: NO fuse, NO qconfig, NO prepare_qat.
+        # In models.py the QuantStub/DeQuantStub are identity ops until
+        # prepare_qat runs, so an unprepared FastDVDnet IS the FP32 model.
+        # Conv/BN stay as separate ops -> the ONNX has explicit BatchNorm nodes
+        # (do_constant_folding will fold them into the convs at export time).
+        print("> FP32 mode: skipping fuse / qconfig / prepare_qat.")
     else:
-        model.set_qconfig()              # original 'x86' (NOT exportable)
+        # Correct order: fuse -> set qconfig -> prepare_qat. We set the
+        # EXPORTABLE qconfig BEFORE prepare_qat so plain FakeQuantize modules
+        # are instantiated from the start (setting qconfig AFTER prepare_qat is
+        # a no-op — the QAT modules already exist and won't be re-swapped).
+        from torch.ao.quantization import prepare_qat
+        model.eval()
+        model.fuse_model()
+        model.train()
 
-    prepare_qat(model, inplace=True)
+        if args.export_qconfig:
+            _set_exportable_qconfig(model)   # plain FakeQuantize, exportable
+        else:
+            model.set_qconfig()              # original 'x86' (NOT exportable)
 
-    # Belt-and-suspenders: physically replace any FusedMovingAvgObsFakeQuantize
-    # that still slipped through (e.g. from a default on a module type), copying
-    # its learned buffers into a plain FakeQuantize. Guarantees the exporter
-    # never sees the fused aten op.
-    if args.export_qconfig:
-        _swap_fused_fakequant(model)
+        prepare_qat(model, inplace=True)
+
+        # Belt-and-suspenders: physically replace any
+        # FusedMovingAvgObsFakeQuantize that still slipped through, copying its
+        # learned buffers into a plain FakeQuantize. Guarantees the exporter
+        # never sees the fused aten op.
+        if args.export_qconfig:
+            _swap_fused_fakequant(model)
 
     if args.qat_ckpt:
-        print(f"> Loading QAT checkpoint: {args.qat_ckpt}")
+        kind = "FP32" if args.mode == "fp32" else "QAT"
+        print(f"> Loading {kind} checkpoint: {args.qat_ckpt}")
         sd = torch.load(args.qat_ckpt, map_location="cpu")
         if any(k.startswith("module.") for k in sd):
             sd = remove_dataparallel_wrapper(sd)
@@ -201,9 +210,69 @@ def make_dummy_inputs(args):
     return (y, uv_noise, bank_k, bank_v)
 
 
+def _simplify_onnx(path):
+    """Strip Identity nodes and fold redundant structure.
+
+    Tries onnx-simplifier first (best result: also folds shape subgraphs like
+    the Shape/Gather/Unsqueeze/Concat chains from dynamic_axes). Falls back to
+    a manual Identity-removal pass if onnxsim isn't installed.
+    """
+    import onnx
+
+    model = onnx.load(path)
+    n_before = len(model.graph.node)
+
+    try:
+        import onnxsim
+        model, ok = onnxsim.simplify(model)
+        if not ok:
+            print("  [simplify] onnxsim reported failure; keeping original.")
+            return
+        onnx.save(model, path)
+        print(f"  [simplify] onnxsim: {n_before} -> {len(model.graph.node)} nodes")
+        return
+    except ImportError:
+        print("  [simplify] onnxsim not installed; using manual Identity strip.")
+        print("             (pip install onnxsim  for a better result)")
+
+    # ---- manual fallback: rewire and drop Identity nodes ----
+    graph = model.graph
+    outputs = {o.name for o in graph.output}
+    remap = {}
+    keep = []
+    for node in graph.node:
+        # Never drop an Identity that produces a graph output (its name matters).
+        if node.op_type == "Identity" and node.output[0] not in outputs:
+            remap[node.output[0]] = node.input[0]
+        else:
+            keep.append(node)
+
+    # Resolve chained identities (a -> b -> c).
+    def _resolve(name):
+        seen = set()
+        while name in remap and name not in seen:
+            seen.add(name)
+            name = remap[name]
+        return name
+
+    for node in keep:
+        for i, inp in enumerate(node.input):
+            node.input[i] = _resolve(inp)
+
+    del graph.node[:]
+    graph.node.extend(keep)
+    onnx.checker.check_model(model)
+    onnx.save(model, path)
+    print(f"  [simplify] manual: {n_before} -> {len(keep)} nodes "
+          f"({n_before - len(keep)} Identity removed)")
+
+
 def main():
     p = argparse.ArgumentParser(description="Export QAT FastDVDnet -> ONNX")
-    p.add_argument("--mode", choices=["fakequant", "int8"], default="fakequant")
+    p.add_argument("--mode", choices=["fp32", "fakequant", "int8"],
+                   default="fakequant",
+                   help="fp32: plain float model (no fuse/no quant). "
+                        "fakequant: QDQ training graph. int8: converted (limited).")
     p.add_argument("--qat_ckpt", type=str, default=None)
     p.add_argument("--out", type=str, default="fastdvdnet_qat.onnx")
     p.add_argument("--bank_size", type=int, default=10)
@@ -220,6 +289,12 @@ def main():
                         "(required for fakequant mode; on by default)")
     p.add_argument("--no_export_qconfig", dest="export_qconfig",
                    action="store_false")
+    p.add_argument("--dynamic", action="store_true", default=False,
+                   help="Export with dynamic H/W/bank_len (adds Shape/Gather "
+                        "subgraphs). Default is a static graph.")
+    p.add_argument("--simplify", action="store_true", default=True,
+                   help="Strip Identity nodes / fold shape subgraphs after export")
+    p.add_argument("--no_simplify", dest="simplify", action="store_false")
     args = p.parse_args()
 
     if args.mode == "fakequant" and args.opset < 13:
@@ -239,14 +314,16 @@ def main():
     # min_val/max_val.copy_() traces to aten::copy, which has no ONNX symbolic)
     # and lock fake-quant scales. This is also semantically correct for export —
     # we want fixed, learned scales, not live re-estimation.
-    from torch.ao.quantization import disable_observer
-    model.apply(disable_observer)
-    for m in model.modules():
-        # Freeze fake-quant scale/zero_point (no in-place buffer writes at trace).
-        if hasattr(m, "observer_enabled"):
-            m.observer_enabled[0] = 0
-        if hasattr(m, "fake_quant_enabled"):
-            m.fake_quant_enabled[0] = 1  # keep quant active, just frozen
+    # FP32 mode has no fake-quants/observers, so this is skipped entirely.
+    if args.mode != "fp32":
+        from torch.ao.quantization import disable_observer
+        model.apply(disable_observer)
+        for m in model.modules():
+            # Freeze scale/zero_point (no in-place buffer writes at trace).
+            if hasattr(m, "observer_enabled"):
+                m.observer_enabled[0] = 0
+            if hasattr(m, "fake_quant_enabled"):
+                m.fake_quant_enabled[0] = 1  # keep quant active, just frozen
     model.eval()
 
     # Sanity forward before tracing.
@@ -257,20 +334,33 @@ def main():
     input_names = ["y", "uv_noise", "bank_k", "bank_v"]
     output_names = ["y_res", "uv_res", "curr_k", "curr_v"]
 
+    # dynamic_axes forces runtime shape arithmetic -> Shape/Gather/Unsqueeze/
+    # Concat subgraphs all over the exported graph. For a fixed-resolution NPU
+    # target you almost always want a fully STATIC graph instead.
+    dyn = None
+    if args.dynamic:
+        dyn = {
+            "y":        {2: "H", 3: "W"},
+            "uv_noise": {2: "Hq", 3: "Wq"},
+            "bank_k":   {1: "bank_len"},
+            "bank_v":   {1: "bank_len"},
+        }
+    else:
+        print("> Static export (no dynamic_axes): shapes frozen to the dummy "
+              "input sizes. Use --dynamic for variable H/W/bank_len.")
+
     try:
         torch.onnx.export(
             model, dummy, args.out,
             input_names=input_names, output_names=output_names,
             opset_version=args.opset,
             do_constant_folding=True,
-            dynamic_axes={  # let H/W and bank length vary at inference
-                "y":        {2: "H", 3: "W"},
-                "uv_noise": {2: "Hq", 3: "Wq"},
-                "bank_k":   {1: "bank_len"},
-                "bank_v":   {1: "bank_len"},
-            },
+            dynamic_axes=dyn,
         )
         print(f"> Saved ONNX -> {args.out}")
+
+        if args.simplify:
+            _simplify_onnx(args.out)
     except Exception as e:
         print(f"\n> Export failed: {e}\n> Dumping traced graph to localize the "
               f"offending op (look for the scope of aten::copy / aten::copy_) ...\n")
