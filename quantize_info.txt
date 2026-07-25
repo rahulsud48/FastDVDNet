@@ -1,0 +1,2 @@
+1. Softmax input doesn't need Q-DQ
+2. Sigmoid doesn't need Q-DQ
